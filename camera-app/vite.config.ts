@@ -1,13 +1,11 @@
 import { defineConfig } from 'vite'
 import react from '@vitejs/plugin-react'
 
-// https://vitejs.dev/config/
+// 👇 reemplazá "90296b7228d5.ngrok-free.app" por el dominio que te dio ngrok
 export default defineConfig({
   plugins: [react()],
   server: {
-    host: true, // escucha en todas las interfaces
-    allowedHosts: [
-      '286b42226697.ngrok-free.app' // 👈 agregá tu host de ngrok
-    ]
-  }
+  host: true,
+  allowedHosts: ['.ngrok-free.app'], // permite cualquier subdominio de ngrok
+  },
 })
