@@ -1,18 +1,24 @@
 import { useEffect, useRef, useState } from "react";
 import "./App.css";
 
+/* Capacitor + ML Kit (Document Scanner) */
+import { Capacitor } from "@capacitor/core";
+import { DocumentScanner } from "@capacitor-mlkit/document-scanner";
 
 /* ── Tipos ─────────────────────────────────────────────────────────────── */
 type Step = "welcome" | "form" | "camera" | "result";
+type MultiSelect = Record<string, boolean>;
 
 type ClinicalInfo = {
   name: string;
   age: number | "";
-  smoker: boolean;
-  heartIssues: boolean;
+  sintomaPrincipal: string;
+  inicio: string;
+  desencadenante: string;
+  medicacion: "si" | "no" | "";
+  antecedentes: MultiSelect;
+  otrasCond: MultiSelect;
 };
-
-type Facing = "user" | "environment";
 
 type ApiPrediction = {
   class: string;
@@ -30,47 +36,130 @@ type ApiResponseShape = {
 const pct = (p?: number) =>
   typeof p === "number" ? (p * 100).toFixed(1) + "%" : "—";
 
-/* Etiqueta prolija para cada cámara */
-const getDeviceLabel = (d: MediaDeviceInfo, idx: number) => {
-  const L = d.label || "";
-  if (!L) return `Cámara ${idx + 1}`;
-  return L.replace(/\s*\(.*?\)\s*/g, " ").replace(/\s+/g, " ").trim();
-};
-
-/* Elegir la “mejor” según facing (trasera normal si hay, no-wide) */
-const pickPreferredDevice = (devices: MediaDeviceInfo[], want: Facing) => {
-  if (!devices?.length) return null;
-  const isFront = (s: string) => /front|frontal|user|selfie/i.test(s);
-  const isBack = (s: string) => /back|rear|trasera|environment/i.test(s);
-  const isWide = (s: string) => /wide|ultra|uw|ultra[- ]wide/i.test(s);
-
-  if (want === "environment") {
-    const normalBack = devices.find(d => isBack(d.label || "") && !isWide(d.label || ""));
-    if (normalBack) return normalBack.deviceId;
-    const anyBack = devices.find(d => isBack(d.label || ""));
-    if (anyBack) return anyBack.deviceId;
-  } else {
-    const anyFront = devices.find(d => isFront(d.label || ""));
-    if (anyFront) return anyFront.deviceId;
-  }
-  return devices[0].deviceId;
-};
-
-/* ── Ícono (SVG) para alternar cámara ── */
-function CameraSwitchIcon(props: React.SVGProps<SVGSVGElement>) {
-  return (
-    <svg viewBox="0 0 24 24" width="24" height="24" aria-hidden="true" {...props}>
-      <path
-        d="M7 7h7l-1.5-1.5.71-.71L15.83 7l-2.62 2.21-.71-.71L14 7H7a4 4 0 0 0-4 4v2H2v-2a5 5 0 0 1-5 5Zm10 10h-7l1.5 1.5-.71.71L8.17 17l2.62-2.21.71.71L10 17h7a4 4 0 0 0 4-4v-2h1v2a5 5 0 0 1-5 5Z"
-        fill="currentColor"
-      />
-    </svg>
-  );
+/* ── OpenCV "like scanner" helpers para WEB ────────────────────────────── */
+/**
+ * IMPORTANTE: asegurate de cargar OpenCV.js en index.html
+ * <script async src="/opencv/opencv.js"></script>
+ */
+declare global {
+  interface Window { cv: any }
 }
+
+/** Espera a que OpenCV.js esté cargado */
+async function waitForOpenCV(): Promise<void> {
+  if (typeof window === "undefined") return;
+  await new Promise<void>((res) => {
+    const check = () => (window as any).cv && (window as any).cv.Mat ? res() : setTimeout(check, 50);
+    check();
+  });
+}
+
+/** Mejora tipo escáner: corrige perspectiva y binariza. Devuelve dataURL */
+async function enhanceDocumentWithOpenCV(srcDataUrl: string): Promise<string> {
+  await waitForOpenCV();
+  const cv = (window as any).cv;
+
+  const img = await (async () => {
+    const i = new window.Image();
+    i.crossOrigin = "anonymous";
+    i.src = srcDataUrl;
+    await new Promise((resolve, reject) => {
+      i.onload = () => resolve(null);
+      i.onerror = () => reject(new Error("No se pudo cargar la imagen. Verifique permisos o formato."));
+    });
+    // Validar tamaño
+    if (!i.width || !i.height) throw new Error("La imagen no se pudo cargar correctamente. Pruebe con otra foto o revise los permisos del navegador.");
+    return i;
+  })();
+
+  // dataURL -> Mat
+  const canvas = document.createElement("canvas");
+  canvas.width = img.width; canvas.height = img.height;
+  const ctx = canvas.getContext("2d")!;
+  ctx.drawImage(img, 0, 0);
+  const src = cv.imread(canvas);
+
+  // Mejorar contraste y escaneo tipo documento
+  const gray = new cv.Mat();
+  cv.cvtColor(src, gray, cv.COLOR_RGBA2GRAY);
+
+  // Suavizado para reducir ruido
+  const blurred = new cv.Mat();
+  cv.GaussianBlur(gray, blurred, new cv.Size(3,3), 0);
+
+  // Umbralización adaptativa más suave
+  const bin = new cv.Mat();
+  cv.adaptiveThreshold(blurred, bin, 255, cv.ADAPTIVE_THRESH_MEAN_C, cv.THRESH_BINARY, 15, 10);
+
+  // Convertir a dataURL
+  const outCanvas = document.createElement("canvas");
+  outCanvas.width = bin.cols; outCanvas.height = bin.rows;
+  cv.imshow(outCanvas, bin);
+  const dstDataUrl = outCanvas.toDataURL("image/png");
+
+  // liberar
+  src.delete(); gray.delete(); blurred.delete(); bin.delete();
+
+  return dstDataUrl;
+}
+
+/* ── Capacitor helpers ─────────────────────────────────────────────────── */
+const isNative = Capacitor.isNativePlatform();
+const normalizeUri = (uri: string) => (isNative ? Capacitor.convertFileSrc(uri) : uri);
+
+/* ── Opciones para Formularios ─────────────────────────────────────────── */
+const SINTOMAS_OPTIONS = [
+  { value: "dolor_precordial", label: "Dolor pre cordial" },
+  { value: "palpitaciones", label: "Palpitaciones" },
+  { value: "disnea", label: "Disnea" },
+  { value: "sincope", label: "Síncope" },
+  { value: "mareos", label: "Mareos" },
+  { value: "otros", label: "Otros" },
+];
+
+const INICIO_OPTIONS = [
+  { value: "subito", label: "Súbito" },
+  { value: "progresivo", label: "Progresivo" },
+];
+
+const DESENCADENANTE_OPTIONS = [
+  { value: "esfuerzo", label: "Con esfuerzo" },
+  { value: "reposo", label: "Reposo" },
+  { value: "emociones", label: "Emociones" },
+  { value: "respiracion", label: "Con respiración" },
+  { value: "otro", label: "Otro" },
+];
+
+const ANTECEDENTES_OPTIONS = {
+  tabaquista: "Tabaquista",
+  enf_coronaria: "Enf. coronaria",
+  diabetes: "Diabetes",
+  dislipemia: "Dislipemia",
+  hta: "Hipertensión (HTA)",
+  arritmia: "Arritmia conocida",
+};
+
+const OTRAS_COND_OPTIONS = {
+  fiebre: "Fiebre",
+  anemia: "Anemia / Sangrado activo",
+  hipoxia: "Hipoxia",
+  sustancias: "Consumo de sustancias",
+};
+
+// Íconos para síntomas (Font Awesome)
+const SYMPTOM_ICONS: Record<string,string> = {
+  dolor_precordial: "fa-solid fa-heart-pulse",
+  palpitaciones: "fa-solid fa-wave-square",
+  disnea: "fa-solid fa-lungs",
+  sincope: "fa-solid fa-brain",
+  mareos: "fa-solid fa-arrows-rotate",
+  otros: "fa-solid fa-plus",
+};
 
 /* ── App ───────────────────────────────────────────────────────────────── */
 export default function App() {
   const [step, setStep] = useState<Step>("welcome");
+  const fileInputRef = useRef<HTMLInputElement | null>(null);
 
   /* ── MÉDICO ───────────────────────────────────────────────────────────── */
   const [doctorName, setDoctorName] = useState<string>("");
@@ -92,203 +181,112 @@ export default function App() {
     setStep("form");
   };
 
-  /* ── FORM PACIENTE ────────────────────────────────────────────────────── */
-  const [form, setForm] = useState<ClinicalInfo>({
+  /* ── FORM PACIENTE (COMPLETO) ─────────────────────────────────────────── */
+  const getInitialFormState = (): ClinicalInfo => ({
     name: "",
     age: "",
-    smoker: false,
-    heartIssues: false,
+    sintomaPrincipal: "",
+    inicio: "",
+    desencadenante: "",
+    medicacion: "",
+    antecedentes: Object.keys(ANTECEDENTES_OPTIONS).reduce((acc, key) => ({ ...acc, [key]: false }), {} as MultiSelect),
+    otrasCond: Object.keys(OTRAS_COND_OPTIONS).reduce((acc, key) => ({ ...acc, [key]: false }), {} as MultiSelect),
   });
+
+  const [form, setForm] = useState<ClinicalInfo>(getInitialFormState());
+  const [formStep, setFormStep] = useState<1|2|3>(1);
   const [formError, setFormError] = useState<string | null>(null);
+
+  const handleMultiSelectChange = (
+    category: "antecedentes" | "otrasCond",
+    key: string,
+    isChecked: boolean
+  ) => {
+    setForm((f) => ({
+      ...f,
+      [category]: {
+        ...(f as any)[category],
+        [key]: isChecked,
+      },
+    }));
+  };
 
   const handleStartCamera = (e: React.FormEvent) => {
     e.preventDefault();
     setFormError(null);
-
     if (!form.name.trim()) {
-      setFormError("El nombre del paciente es obligatorio.");
-      return;
+      setFormError("El nombre del paciente es obligatorio."); return;
     }
     if (form.age === "" || Number.isNaN(Number(form.age)) || Number(form.age) <= 0) {
-      setFormError("La edad debe ser un número mayor a 0.");
-      return;
+      setFormError("La edad debe ser un número válido mayor a 0."); return;
+    }
+    if (!form.sintomaPrincipal) {
+      setFormError("El síntoma principal es obligatorio."); return;
     }
     setStep("camera");
   };
+  
+  const resetForm = () => {
+    setForm(getInitialFormState());
+  };
 
-  /* ── CÁMARA + ADJUNTO ─────────────────────────────────────────────────── */
-  const videoRef = useRef<HTMLVideoElement | null>(null);
-  const currentStreamRef = useRef<MediaStream | null>(null);
-  const startTokenRef = useRef(0);
-  const [camError, setCamError] = useState<string | null>(null);
-
-  const [photoDataUrl, setPhotoDataUrl] = useState<string | null>(null); // imagen actual
-  const [videoDevices, setVideoDevices] = useState<MediaDeviceInfo[] | null>(null);
-  const [selectedDeviceId, setSelectedDeviceId] = useState<string | null>(null);
-  const [facing, setFacing] = useState<Facing>("environment");
-
-  // Estados para API
+  /* ── Estados para manejo de imagen y API ── */
+  const [photoDataUrl, setPhotoDataUrl] = useState<string | null>(null);
   const [apiLoading, setApiLoading] = useState(false);
   const [apiError, setApiError] = useState<string | null>(null);
   const [apiResponse, setApiResponse] = useState<ApiResponseShape | null>(null);
+  // Riesgo calculado por el servidor (si el backend lo devuelve)
+  const [serverRisk, setServerRisk] = useState<RiskResult | null>(null);
+  const [apiCustomError, setApiCustomError] = useState<string | null>(null);
+  const [previewUrl, setPreviewUrl] = useState<string | null>(null);
 
-  const stopCurrentStream = () => {
-    currentStreamRef.current?.getTracks()?.forEach((t) => t.stop());
-    currentStreamRef.current = null;
-  };
-
-  const listVideoDevices = async () => {
-    try {
-      const all = await navigator.mediaDevices.enumerateDevices();
-      const vids = all.filter((d) => d.kind === "videoinput");
-      setVideoDevices(vids.length ? vids : null);
-      return vids;
-    } catch {
-      setVideoDevices(null);
-      return [];
-    }
-  };
-
-  const guessDeviceIdByFacing = (devices: MediaDeviceInfo[], want: Facing) => {
-    if (!devices?.length) return null;
-    const isFront = (s: string) => /front|frontal|user|anter/i.test(s);
-    const isBack =  (s: string) => /back|rear|trasera|environment/i.test(s);
-    const candidates = devices.filter((d) => (want === "user" ? isFront(d.label) : isBack(d.label)));
-    if (candidates.length) return candidates[0].deviceId;
-    if (devices.length > 1) return want === "user" ? devices[0].deviceId : devices[1].deviceId;
-    return devices[0].deviceId;
-  };
-
-  const openCamera = async (opts?: { deviceId?: string | null; facingMode?: Facing }) => {
-    setCamError(null);
-    stopCurrentStream();
-
-    const token = ++startTokenRef.current;
-
-    if (!("mediaDevices" in navigator) || !navigator.mediaDevices.getUserMedia) {
-      setCamError("Este navegador no soporta acceso a la cámara");
+  /* ── Escaneo y procesamiento de imagen (ROBUSTO, tomado del 1º código) ── */
+  const handleScanDocument = async () => {
+    // En navegador (ngrok) no hay plugin: disparamos file picker
+    if (!isNative || !Capacitor.isPluginAvailable?.("DocumentScanner")) {
+      fileInputRef.current?.click();
       return;
     }
 
-   let constraints: MediaStreamConstraints = {
-     audio: false,
-     video: {
-       facingMode: opts?.facingMode ?? facing,
-       width: { ideal: 1280 },     // “pista” para que no use el ultra-wide
-       height: { ideal: 720 },
-       // advanced: [{ zoom: 1.0 }] // algunos navegadores soportan zoom
-     }
-   };
-
-    if (opts?.deviceId) constraints.video = { deviceId: { exact: opts.deviceId } };
-    else if (opts?.facingMode) constraints.video = { facingMode: opts.facingMode };
-    else constraints.video = { facingMode: facing };
-
     try {
-      const stream = await navigator.mediaDevices.getUserMedia(constraints);
-      if (token !== startTokenRef.current) {
-        stream.getTracks().forEach((t) => t.stop());
-        return;
-      }
-      currentStreamRef.current = stream;
-
-      const el = videoRef.current;
-      if (!el) return;
-      if (el.srcObject !== stream) el.srcObject = stream;
-
-      await new Promise<void>((resolve) => {
-        const onReady = () => {
-          el.removeEventListener("loadedmetadata", onReady);
-          el.removeEventListener("canplay", onReady);
-          resolve();
-        };
-        el.addEventListener("loadedmetadata", onReady, { once: true });
-        el.addEventListener("canplay", onReady, { once: true });
+      const result = await DocumentScanner.scanDocument({
+        resultFormats: "JPEG",
+        pageLimit: 1,
+        galleryImportAllowed: true,
+        scannerMode: "FULL",
       });
 
-      await el.play();
-      const vids = await listVideoDevices();
+      if (!result?.scannedImages?.length) {
+        throw new Error("No se obtuvo ninguna imagen del escaneo");
+      }
 
-      if (!selectedDeviceId) {
-        const chosen =
-          (constraints.video as MediaTrackConstraints)?.deviceId
-            ? (constraints.video as any).deviceId.exact
-            : guessDeviceIdByFacing(vids, opts?.facingMode || facing);
-        setSelectedDeviceId(chosen || null);
+      try {
+        const src = normalizeUri(result.scannedImages[0]);
+        const resp = await fetch(src);
+        const blob = await resp.blob();
+        const reader = new FileReader();
+        const dataUrl = await new Promise<string>((resolve, reject) => {
+          reader.onload = () => resolve(reader.result as string);
+          reader.onerror = reject;
+          reader.readAsDataURL(blob);
+        });
+
+        // Procesar imagen para mejorar visualización del ECG
+        const processedImage = await enhanceDocumentWithOpenCV(dataUrl);
+        setPhotoDataUrl(processedImage);
+        setPreviewUrl(processedImage); // Mostrar previsualización
+        setApiResponse(null);
+        setApiError(null);
+      } catch (err) {
+        console.error("Error al procesar la imagen:", err);
+        throw new Error("No se pudo procesar la imagen escaneada");
       }
     } catch (e: any) {
-      setCamError(e?.message ?? "No se pudo acceder a la cámara");
+      console.error("Error al escanear:", e);
+      setApiError(e?.message ?? "No se pudo abrir el escáner");
     }
   };
 
-  useEffect(() => {
-    if (step !== "camera") return;
-
-    let mounted = true;
-    (async () => {
-      // 1) Abrir con facing preferido
-      await openCamera({ facingMode: facing });
-      if (!mounted) return;
-
-      // 2) Obtener dispositivos con labels (tras dar permiso)
-      const vids = await listVideoDevices();
-      if (!mounted) return;
-
-      // 3) Si no hay selección aún, elegir “principal” según facing
-      if (!selectedDeviceId && vids.length) {
-        const preferred = pickPreferredDevice(vids, facing);
-        if (preferred) {
-          setSelectedDeviceId(preferred);
-          await openCamera({ deviceId: preferred, facingMode: facing });
-        }
-      }
-    })();
-
-    return () => {
-      mounted = false;
-      stopCurrentStream();
-    };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [step]);
-
-  const switchFacing = async (want: Facing) => {
-    setFacing(want);
-    let deviceId: string | null = null;
-
-    const vids = videoDevices?.length ? videoDevices : await listVideoDevices();
-    deviceId = pickPreferredDevice(vids, want) || guessDeviceIdByFacing(vids, want);
-
-    await openCamera({ deviceId, facingMode: want });
-    setSelectedDeviceId(deviceId || null);
-  };
-
-  const toggleFacing = async () => {
-    await switchFacing(facing === "environment" ? "user" : "environment");
-  };
-
-  /* --- Captura desde cámara --- */
-  const handleCapture = () => {
-    const video = videoRef.current;
-    if (!video) return;
-    const w = video.videoWidth;
-    const h = video.videoHeight;
-    if (!w || !h) {
-      setCamError("La cámara aún no está lista para capturar");
-      return;
-    }
-    const canvas = document.createElement("canvas");
-    canvas.width = w;
-    canvas.height = h;
-    const ctx = canvas.getContext("2d");
-    if (!ctx) return;
-    ctx.drawImage(video, 0, 0, w, h);
-    const dataUrl = canvas.toDataURL("image/png");
-    setPhotoDataUrl(dataUrl);
-    setApiResponse(null);
-    setApiError(null);
-  };
-
-  /* --- Adjuntar archivo en vez de usar cámara --- */
   const handleFilePick = async (file: File) => {
     if (!file) return;
     if (!file.type.startsWith("image/")) {
@@ -296,9 +294,13 @@ export default function App() {
       return;
     }
     const dataUrl = await fileToDataUrl(file);
-    setPhotoDataUrl(dataUrl);
+    // Procesar imagen para mejorar visualización del ECG
+    const processedImage = await enhanceDocumentWithOpenCV(dataUrl);
+    setPhotoDataUrl(processedImage);
+    setPreviewUrl(processedImage); // Mostrar previsualización
     setApiResponse(null);
     setApiError(null);
+    if (step !== "camera") setStep("camera");
   };
 
   const fileToDataUrl = (file: File) =>
@@ -311,75 +313,257 @@ export default function App() {
 
   const clearPhoto = () => {
     setPhotoDataUrl(null);
+    setPreviewUrl(null);
     setApiResponse(null);
     setApiError(null);
   };
 
-  /* ── Enviar imagen a tu API y mostrar respuesta ───────────────────────── */
+  /* ── Wizard handlers ─────────────────────────────────────────────────── */
+  const nextFromBasics = () => {
+    setFormError(null);
+    if (!form.name.trim()) { setFormError("El nombre del paciente es obligatorio."); return; }
+    if (form.age === "" || Number.isNaN(Number(form.age)) || Number(form.age) <= 0) {
+      setFormError("La edad debe ser un número válido mayor a 0."); return; }
+    setFormStep(2);
+  };
+
+  const nextFromSymptoms = () => {
+    setFormError(null);
+    if (!form.sintomaPrincipal) { setFormError("Seleccioná el síntoma principal."); return; }
+    setFormStep(3);
+  };
+
+  /* ── Enviar imagen a API y mostrar respuesta (de tu 1º código) ───────── */
   const sendImageToApi = async (): Promise<void> => {
     if (!photoDataUrl) {
-      setApiError("No hay imagen para enviar.");
+      setApiError("No hay imagen para analizar.");
       return;
     }
 
-    const base64Image = photoDataUrl.split(",")[1];
+    // POST al backend para que devuelva el análisis del ECG + riesgo y acciones.
+    // Ajusta API_ANALYZE_URL según tu backend (ruta relativa /api/analyze por defecto).
+    const API_ANALYZE_URL = "/api/analyze";
+
+    setApiLoading(true);
+    setApiError(null);
+    setApiCustomError(null);
+    setServerRisk(null);
 
     try {
-      setApiLoading(true);
-      setApiError(null);
+      const payload = {
+        image: photoDataUrl,
+        clinical: form,
+        doctor: doctorName,
+      };
 
-      const resp = await fetch("https://a45c5324ca52.ngrok-free.app/predict", {
+      const resp = await fetch(API_ANALYZE_URL, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ image_b64: base64Image }),
+        body: JSON.stringify(payload),
       });
 
       if (!resp.ok) {
-        const text = await resp.text().catch(() => "");
-        throw new Error(`API ${resp.status} ${resp.statusText}${text ? " - " + text : ""}`);
+        const text = await resp.text();
+        throw new Error(text || `HTTP ${resp.status}`);
       }
 
-      const json = (await resp.json()) as ApiResponseShape;
-      setApiResponse(json);
-      setStep("result"); // 👈 saltamos a la pantalla de resultado
+      const json = await resp.json();
+
+      // Se espera que el backend devuelva al menos { apiResponse?: ApiResponseShape, risk?: RiskResult }
+      setApiResponse(json.apiResponse ?? null);
+      setServerRisk(json.risk ?? null);
+
+      // Si el backend envía un mensaje de error personalizado
+      if (json.error || json.message) {
+        setApiCustomError(json.error ?? json.message ?? null);
+      }
+
+      setStep("result");
     } catch (err: any) {
-      setApiError(err?.message || "Error al enviar imagen a la API");
-      setApiResponse(null);
+      console.error("Error al comunicarse con el backend:", err);
+      setApiError(err?.message ?? "Error al comunicarse con el servidor");
     } finally {
       setApiLoading(false);
     }
   };
 
-  /* ── UI ────────────────────────────────────────────────────────────────── */
+  /* ── 🧠 LÓGICA DE RIESGO COMBINADO (del 2º código) ───────────────────── */
+  type RiskLevel = "alto" | "medio" | "bajo" | "error";
+  type RiskResult = {
+    level: RiskLevel;
+    title: string;
+    description: string;
+    action: string;
+  };
+
+  const calculateCombinedRisk = (
+    apiResp: ApiResponseShape | null,
+    clinicalData: ClinicalInfo
+  ): RiskResult => {
+    if (!apiResp || !apiResp.prediction) {
+      return {
+        level: "error",
+        title: "Error de Análisis",
+        description: apiCustomError || "No se pudo procesar la imagen del ECG.",
+        action: "Por favor, intente escanear nuevamente.",
+      };
+    }
+    const { prediction } = apiResp;
+    const { antecedentes, sintomaPrincipal } = clinicalData;
+
+    // REGLA 1: ALTO RIESGO
+    if (prediction.class === "MI" && prediction.probability > 0.8) {
+      return {
+        level: "alto",
+        title: "ALTO RIESGO DETECTADO",
+        description: "El modelo detecta patrones consistentes con Infarto de Miocardio (MI) con alta confianza.",
+        action: "Se recomienda derivación urgente a cardiología.",
+      };
+    }
+    if (prediction.class === "Anormal" && antecedentes.tabaquista && sintomaPrincipal === "dolor_precordial") {
+      return {
+        level: "alto",
+        title: "ALTO RIESGO POR CLÍNICA",
+        description: "El modelo detecta anomalías en un paciente con factores de riesgo clave (tabaquista, dolor precordial).",
+        action: "Se recomienda derivación urgente a cardiología.",
+      };
+    }
+    // REGLA 2: RIESGO MEDIO
+    if (prediction.class === "Anormal" || apiResp.review === true) {
+      return {
+        level: "medio",
+        title: "REVISIÓN SUGERIDA",
+        description: "El modelo detecta patrones anómalos no específicos o el resultado es inconcluso.",
+        action: "Se sugiere derivar a cardiología para un análisis completo.",
+      };
+    }
+    // REGLA 3: BAJO RIESGO
+    if (prediction.class === "Normal" && prediction.probability > 0.7) {
+      return {
+        level: "bajo",
+        title: "PROBABLE NORMALIDAD",
+        description: "El modelo no detecta anomalías significativas.",
+        action: "Confirmar el diagnóstico con la evaluación clínica completa.",
+      };
+    }
+    // Fallback
+    return {
+      level: "medio",
+      title: "REVISIÓN SUGERIDA",
+      description: "El resultado del modelo es inconcluso. Se recomienda evaluación manual.",
+      action: "Se sugiere derivar a cardiología si la clínica lo justifica.",
+    };
+  };
+
+  // Si el backend retorna el riesgo completo, lo usamos; si no, fallback a la lógica local.
+  const effectiveRisk = serverRisk ?? calculateCombinedRisk(apiResponse, form);
+
+  /* ── 📱 LÓGICA WHATSAPP (del 2º código) ──────────────────────────────── */
+  const getWhatsAppMessage = () => {
+    const antecedentesTxt = Object.entries(form.antecedentes)
+      .filter(([, isChecked]) => isChecked)
+      .map(([key]) => ANTECEDENTES_OPTIONS[key as keyof typeof ANTECEDENTES_OPTIONS])
+      .join(', ');
+      
+    const otrasCondTxt = Object.entries(form.otrasCond)
+      .filter(([, isChecked]) => isChecked)
+      .map(([key]) => OTRAS_COND_OPTIONS[key as keyof typeof OTRAS_COND_OPTIONS])
+      .join(', ');
+
+    const message = `
+*PRE-DIAGNÓSTICO ECG*
+*Médico:* ${doctorName}
+*Paciente:* ${form.name} (${form.age} años)
+
+*Datos Clínicos:*
+- *Síntoma:* ${SINTOMAS_OPTIONS.find(o => o.value === form.sintomaPrincipal)?.label || 'N/A'}
+- *Inicio:* ${INICIO_OPTIONS.find(o => o.value === form.inicio)?.label || 'N/A'}
+- *Desencadenante:* ${DESENCADENANTE_OPTIONS.find(o => o.value === form.desencadenante)?.label || 'N/A'}
+- *Antecedentes:* ${antecedentesTxt || 'Ninguno'}
+- *Otras Cond.:* ${otrasCondTxt || 'Ninguna'}
+- *Medicación:* ${form.medicacion.toUpperCase() || 'N/A'}
+
+*Resultado de la App:*
+- *Nivel de Riesgo:* ${effectiveRisk.title}
+- *Acción Sugerida:* ${effectiveRisk.action}
+
+_(Se adjunta imagen del ECG)_
+    `;
+    return encodeURIComponent(message.trim());
+  };
+  
+  const WHATSAPP_NUMBER = "+5493754477472"; 
+  const whatsappUrl = `https://wa.me/${WHATSAPP_NUMBER}?text=${getWhatsAppMessage()}`;
+
+
   return (
     <div className="app">
+      {/* Font Awesome for medical-styled icons */}
+      <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.0/css/all.min.css" />
+      <style>{`
+        .urgent-banner { display:flex; align-items:center; gap:12px; background: linear-gradient(90deg,#7f1d1d,#dc2626); color:#fff; padding:16px; border-radius:12px; border:2px solid #ef4444; animation: urgentPulse 1.5s infinite; }
+        .urgent-banner__icon { font-size:28px; }
+        .urgent-banner__body { display:flex; flex-direction:column; }
+        .urgent-banner__title { font-weight:800; letter-spacing:.5px; font-size:18px; line-height:1.1; }
+        .urgent-banner__subtitle { font-size:14px; opacity:.95; margin-top:2px; }
+        @keyframes urgentPulse { 0%{box-shadow:0 0 0 0 rgba(220,38,38,.7)} 70%{box-shadow:0 0 0 14px rgba(220,38,38,0)} 100%{box-shadow:0 0 0 0 rgba(220,38,38,0)} }
+        .btn-urgent { background:#b91c1c; border:2px solid #ef4444; color:#fff !important; animation: urgentPulse 1.5s infinite; }
+        .risk-card[data-level="alto"] { border:2px solid #ef4444; }
+
+        /* Wizard styles */
+        .stepper { display:flex; gap:8px; margin-bottom:12px; }
+        .step-dot { width:10px; height:10px; border-radius:999px; background:#e5e7eb; }
+        .step-dot.active { background:#2563eb; }
+        .section-title { font-weight:700; font-size:18px; margin:4px 0 8px; }
+
+        /* Symptom cards grid */
+        .symptom-grid { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:10px; }
+        @media (min-width:420px){ .symptom-grid{ grid-template-columns:repeat(3,minmax(0,1fr)); } }
+        .symptom-card {
+          display:flex;
+          flex-direction:column;
+          align-items:flex-start;
+          gap:6px;
+          padding:14px;
+          border:2px solid #ffffff;
+          border-radius:14px;
+          background:#0d1b4f;
+          cursor:pointer;
+          user-select:none;
+          color:#ffffff !important;
+        }
+        .symptom-card i { font-size:18px; opacity:.9; }
+        .symptom-card .label { font-size:14px; font-weight:600; }
+        .symptom-card.active {
+          border-color:#60a5fa;
+          background:#1e3a8a;
+          color:#ffffff !important;
+        }
+        .controls-row { display:flex; gap:10px; }
+      `}</style>
+      <style>{`
+        .urgent-banner { display:flex; align-items:center; gap:12px; background: linear-gradient(90deg,#7f1d1d,#dc2626); color:#fff; padding:16px; border-radius:12px; border:2px solid #ef4444; animation: urgentPulse 1.5s infinite; }
+        .urgent-banner__icon { font-size:28px; }
+        .urgent-banner__body { display:flex; flex-direction:column; }
+        .urgent-banner__title { font-weight:800; letter-spacing:.5px; font-size:18px; line-height:1.1; }
+        .urgent-banner__subtitle { font-size:14px; opacity:.95; margin-top:2px; }
+        @keyframes urgentPulse { 0%{box-shadow:0 0 0 0 rgba(220,38,38,.7)} 70%{box-shadow:0 0 0 14px rgba(220,38,38,0)} 100%{box-shadow:0 0 0 0 rgba(220,38,38,0)} }
+        .btn-urgent { background:#b91c1c; border:2px solid #ef4444; color:#fff !important; animation: urgentPulse 1.5s infinite; }
+        .risk-card[data-level="alto"] { border:2px solid #ef4444; }
+      `}</style>
       {/* ── PANTALLA 1: Bienvenida / Médico ── */}
       {step === "welcome" && (
         <div className="app" style={{ display: "flex", alignItems: "center", justifyContent: "center" }}>
-          <div
-            className="card card--elevated"
-            style={{ textAlign: "center", padding: "32px 24px", maxWidth: 400, width: "100%" }}
-          >
-            <img
-              src="/logo.png"
-              alt="Logo"
-              style={{ width: 96, height: 96, objectFit: "contain", margin: "0 auto 16px", display: "block" }}
-            />
+          <div className="card card--elevated" style={{ textAlign: "center", padding: "32px 24px", maxWidth: 400, width: "100%" }}>
+            <img src="/logo.png" alt="Logo" style={{ width: 96, height: 96, objectFit: "contain", margin: "0 auto 16px", display: "block" }} />
             <h1 className="h1">Ingreso del médico</h1>
             <p className="subtle" style={{ marginTop: 4 }}>Ingresá tu nombre para continuar.</p>
-
             <form onSubmit={handleEnter} className="form" style={{ marginTop: 16 }}>
               <div className="field">
                 <label className="label" htmlFor="doctor">Nombre del médico</label>
-                <input
-                  id="doctor" className="input" type="text"
-                  value={doctorName} onChange={(e) => setDoctorName(e.target.value)}
-                  placeholder="Ej: Dra. María González" required autoComplete="name"
-                />
+                <input id="doctor" className="input" type="text" value={doctorName} onChange={(e) => setDoctorName(e.target.value)} placeholder="Ej: Dra. María González" required autoComplete="name" />
               </div>
-
               {doctorError && <p className="error" role="alert">{doctorError}</p>}
-
               <div className="toolbar" style={{ justifyContent: "center" }}>
                 <button type="submit" className="btn btn-primary">Ingresar</button>
               </div>
@@ -388,259 +572,282 @@ export default function App() {
         </div>
       )}
 
-      {/* ── PANTALLA 2: Formulario paciente ── */}
-      {/* ── PANTALLA 2: Formulario paciente ── */}
+      {/* ── PANTALLA 2: Formulario paciente (COMPLETO) ── */}
       {step === "form" && (
         <div className="stack formPage full-viewport">
-          <h1 className="h1">Información clínica básica</h1>
-
+          <h1 className="h1">Información clínica del paciente</h1>
           <div className="subtle" style={{ marginBottom: 4 }}>
             Médico: <strong>{doctorName || "—"}</strong>
           </div>
 
-          {/* 👇 agregá formCard para estilos responsivos */}
-          <form className="card form card--elevated formCard" onSubmit={handleStartCamera} noValidate>
-            <div className="field">
-              <label className="label" htmlFor="name">Nombre del paciente</label>
-              <input
-                id="name" className="input" type="text"
-                value={form.name}
-                onChange={(e) => setForm((f) => ({ ...f, name: e.target.value }))}
-                placeholder="Ej: Juan Pérez" required autoComplete="name"
-              />
+          <form className="card form card--elevated formCard" onSubmit={(e)=>{e.preventDefault(); if(formStep===1) nextFromBasics(); else if(formStep===2) nextFromSymptoms(); else handleStartCamera(e);}} noValidate>
+            {/* Stepper */}
+            <div className="stepper" aria-hidden>
+              <div className={`step-dot ${formStep===1?"active":""}`}></div>
+              <div className={`step-dot ${formStep===2?"active":""}`}></div>
+              <div className={`step-dot ${formStep===3?"active":""}`}></div>
             </div>
 
-            <div className="field">
-              <label className="label" htmlFor="age">Edad</label>
-              <input
-                id="age" className="input" type="number" min={1} max={120}
-                value={form.age}
-                onChange={(e) => setForm((f) => ({ ...f, age: e.target.value === "" ? "" : Number(e.target.value) }))}
-                placeholder="Ej: 45" required inputMode="numeric"
-              />
-            </div>
+            {/* Paso 1: Datos básicos */}
+            {formStep===1 && (
+              <div className="stack">
+                <div className="section-title">Datos básicos</div>
+                <div className="row-fields">
+                  <div className="field" style={{ flex: 2 }}>
+                    <label className="label" htmlFor="name">Nombre del paciente</label>
+                    <input id="name" className="input" type="text" value={form.name} onChange={(e) => setForm((f) => ({ ...f, name: e.target.value }))} placeholder="Ej: Juan Pérez" required />
+                  </div>
+                  <div className="field" style={{ flex: 1 }}>
+                    <label className="label" htmlFor="age">Edad</label>
+                    <input id="age" className="input" type="number" min={1} max={120} value={form.age} onChange={(e) => setForm((f) => ({ ...f, age: e.target.value === "" ? "" : Number(e.target.value) }))} placeholder="Ej: 45" required inputMode="numeric" />
+                  </div>
+                </div>
+                {formError && <p className="error" role="alert">{formError}</p>}
+                <div className="toolbar">
+                  <button type="submit" className="btn btn-primary">Continuar →</button>
+                  <button type="button" className="btn btn-ghost" onClick={() => setStep("welcome")}>
+                    ← Cambiar médico
+                  </button>
+                </div>
+              </div>
+            )}
 
-            <div className="row">
-              <label className="check">
-                <input className="checkbox" type="checkbox"
-                  checked={form.smoker} onChange={(e) => setForm((f) => ({ ...f, smoker: e.target.checked }))}/>
-                ¿Es fumador?
-              </label>
+            {/* Paso 2: Síntoma principal y contexto */}
+            {formStep===2 && (
+              <div className="stack">
+                <div className="section-title">Síntoma principal</div>
+                <div className="symptom-grid">
+                  {SINTOMAS_OPTIONS.map(opt => (
+                    <button type="button" key={opt.value}
+                      className={`symptom-card ${form.sintomaPrincipal===opt.value?"active":""}`}
+                      onClick={()=> setForm(f=>({ ...f, sintomaPrincipal: opt.value }))}
+                      aria-pressed={form.sintomaPrincipal===opt.value}
+                    >
+                      <i className={SYMPTOM_ICONS[opt.value]} aria-hidden></i>
+                      <span className="label">{opt.label}</span>
+                    </button>
+                  ))}
+                </div>
 
-              <label className="check">
-                <input className="checkbox" type="checkbox"
-                  checked={form.heartIssues} onChange={(e) => setForm((f) => ({ ...f, heartIssues: e.target.checked }))}/>
-                ¿Tiene problemas cardíacos?
-              </label>
-            </div>
+                <div className="controls-row">
+                  <div className="field" style={{ flex: 1 }}>
+                    <label className="label" htmlFor="inicio">Inicio</label>
+                    <select id="inicio" className="input" value={form.inicio} onChange={(e) => setForm((f) => ({ ...f, inicio: e.target.value }))}>
+                      <option value="">Seleccionar...</option>
+                      {INICIO_OPTIONS.map((opt) => (
+                        <option key={opt.value} value={opt.value}>{opt.label}</option>
+                      ))}
+                    </select>
+                  </div>
+                  <div className="field" style={{ flex: 1 }}>
+                    <label className="label" htmlFor="desencadenante">Desencadenante</label>
+                    <select id="desencadenante" className="input" value={form.desencadenante} onChange={(e) => setForm((f) => ({ ...f, desencadenante: e.target.value }))}>
+                      <option value="">Seleccionar...</option>
+                      {DESENCADENANTE_OPTIONS.map((opt) => (
+                        <option key={opt.value} value={opt.value}>{opt.label}</option>
+                      ))}
+                    </select>
+                  </div>
+                </div>
 
-            {formError && <p className="error" role="alert">{formError}</p>}
+                {formError && <p className="error" role="alert">{formError}</p>}
+                <div className="toolbar">
+                  <button type="button" className="btn btn-ghost" onClick={()=> setFormStep(1)}>← Volver</button>
+                  <button type="submit" className="btn btn-primary">Continuar →</button>
+                </div>
+              </div>
+            )}
 
-            <div className="toolbar">
-              <button type="submit" className="btn btn-primary">Continuar a la cámara</button>
-              <button type="button" className="btn btn-ghost" onClick={() => setStep("welcome")}>
-                ← Cambiar médico
-              </button>
-            </div>
+            {/* Paso 3: Factores de riesgo */}
+            {formStep===3 && (
+              <div className="stack">
+                <div className="section-title">Factores de riesgo</div>
+                <div className="field">
+                  <label className="label">Antecedentes</label>
+                  <div className="grid-checks">
+                    {Object.entries(ANTECEDENTES_OPTIONS).map(([key, label]) => (
+                      <label className="check" key={key}>
+                        <input className="checkbox" type="checkbox" checked={form.antecedentes[key]} onChange={(e) => handleMultiSelectChange("antecedentes", key, e.target.checked)} />
+                        {label}
+                      </label>
+                    ))}
+                  </div>
+                </div>
+
+                <div className="field">
+                  <label className="label">Otras condiciones</label>
+                  <div className="grid-checks">
+                    {Object.entries(OTRAS_COND_OPTIONS).map(([key, label]) => (
+                      <label className="check" key={key}>
+                        <input className="checkbox" type="checkbox" checked={form.otrasCond[key]} onChange={(e) => handleMultiSelectChange("otrasCond", key, e.target.checked)} />
+                        {label}
+                      </label>
+                    ))}
+                  </div>
+                </div>
+
+                <div className="field">
+                  <label className="label">¿Toma medicación relevante?</label>
+                  <div className="row-fields" style={{ gap: '16px', alignItems: 'center' }}>
+                    <label className="check">
+                      <input type="radio" name="medicacion" value="si" checked={form.medicacion === 'si'} onChange={() => setForm(f => ({...f, medicacion: 'si'}))} /> Sí
+                    </label>
+                    <label className="check">
+                      <input type="radio" name="medicacion" value="no" checked={form.medicacion === 'no'} onChange={() => setForm(f => ({...f, medicacion: 'no'}))} /> No
+                    </label>
+                  </div>
+                </div>
+
+                {formError && <p className="error" role="alert">{formError}</p>}
+                <div className="toolbar">
+                  <button type="button" className="btn btn-ghost" onClick={()=> setFormStep(2)}>← Volver</button>
+                  <button type="submit" className="btn btn-primary">Ir al escaneo →</button>
+                </div>
+              </div>
+            )}
           </form>
-
-          <p className="subtle">Nota: la cámara requiere HTTPS (ngrok) o localhost, y permisos del navegador.</p>
         </div>
       )}
 
-
-      {/* ── PANTALLA 3: Cámara / o adjuntar archivo ── */}
+      {/* ── PANTALLA 3: Escaneo de ECG ── */}
       {step === "camera" && (
         <div className="stack">
-          <h1 className="h1">Cámara</h1>
+          <h1 className="h1">Escanear ECG</h1>
           <div className="subtle" style={{ marginBottom: 4 }}>
             Médico: <strong>{doctorName || "—"}</strong> · Paciente: <strong>{form.name}</strong>
           </div>
-
-          {/* Video + botón flotante para alternar cámara */}
-          <div className="card videoBox" style={{ position: "relative" }}>
-            <video ref={videoRef} className="video" playsInline autoPlay muted />
-            <button
-              type="button" className="fabSwitch" onClick={toggleFacing}
-              aria-label={`Cambiar a cámara ${facing === "environment" ? "frontal" : "trasera"}`}
-              title={`Cambiar a cámara ${facing === "environment" ? "frontal" : "trasera"}`}
-              disabled={apiLoading}
-            >
-              <CameraSwitchIcon className="fabIcon" />
-            </button>
-            <span className="camBadge">{facing === "environment" ? "Trasera" : "Frontal"}</span>
-          </div>
-
-          {/* Selector de cámara */}
-          {videoDevices && videoDevices.length > 0 && (
-            <div className="card camSelect" style={{ display: "flex", alignItems: "center", gap: 10 }}>
-              <label className="label" htmlFor="camSel" style={{ marginRight: 8 }}>Cámara</label>
-              <select
-                id="camSel"
-                className="input"
-                value={selectedDeviceId ?? ""}
-                onChange={async (e) => {
-                  const id = e.target.value || null;
-                  setSelectedDeviceId(id);
-                  await openCamera({ deviceId: id, facingMode: facing });
-                }}
-                disabled={apiLoading}
-                style={{ minWidth: 240 }}
-              >
-                {videoDevices.map((d, i) => (
-                  <option key={d.deviceId || `dev-${i}`} value={d.deviceId}>
-                    {getDeviceLabel(d, i)}
-                  </option>
-                ))}
-              </select>
+          <div className="card card--elevated" style={{ padding: "20px", textAlign: "center" }}>
+            <p className="subtle" style={{ marginBottom: "20px" }}>
+              Coloque el ECG sobre una superficie plana con buena iluminación y presione el botón
+            </p>
+            <div className="toolbar" style={{ justifyContent: "center" }}>
+              <button onClick={handleScanDocument} className="btn btn-primary btn-large" disabled={apiLoading} style={{ fontSize: "1.2em", padding: "12px 24px" }}>
+                📄 Escanear ECG
+              </button>
+              {(!isNative || !Capacitor.isPluginAvailable?.("DocumentScanner")) && (
+                <label className="btn btn-secondary" style={{ cursor: "pointer" }}>
+                  📎 Cargar archivo
+                  <input ref={fileInputRef} type="file" accept="image/*" style={{ display: "none" }} onChange={(e) => {
+                      const file = e.target.files?.[0];
+                      if (file) handleFilePick(file);
+                      e.currentTarget.value = "";
+                    }}/>
+                </label>
+              )}
             </div>
-          )}
-
-          {/* Barra de acciones: capturar, adjuntar, enviar */}
+          </div>
           <div className="toolbar">
-            <button onClick={handleCapture} className="btn btn-primary" disabled={apiLoading}>
-              📸 Sacar foto
-            </button>
-
-            {/* Adjuntar archivo en vez de usar cámara */}
-            <label className="btn btn-secondary" style={{ cursor: "pointer" }}>
-              📎 Adjuntar imagen
-              <input
-                type="file" accept="image/*" style={{ display: "none" }}
-                onChange={(e) => {
-                  const file = e.target.files?.[0];
-                  if (file) handleFilePick(file);
-                  e.currentTarget.value = "";
-                }}
-              />
-            </label>
-
-            {/* Enviar a API */}
             <button onClick={sendImageToApi} className="btn btn-secondary" disabled={apiLoading || !photoDataUrl}>
-              {apiLoading ? "Enviando a API..." : "Enviar a API"}
+              {apiLoading ? "Analizando ECG..." : "Analizar ECG"}
             </button>
-
             <button onClick={() => setStep("form")} className="btn btn-ghost" disabled={apiLoading}>
               ← Volver al formulario
             </button>
-
             {photoDataUrl && (
               <button onClick={clearPhoto} className="btn btn-ghost" disabled={apiLoading}>
                 🗑️ Borrar imagen
               </button>
             )}
           </div>
-
-          {/* Respuesta cruda (opcional para debug) */}
-          {apiError && <p className="error" role="alert">API: {apiError}</p>}
-
-          {/* Vista previa de la imagen actual */}
-          {photoDataUrl && (
+          {apiError && <p className="error" role="alert">Error: {apiError}</p>}
+          {previewUrl && (
             <div className="card">
-              <p style={{ margin: "0 0 8px" }}>Imagen seleccionada:</p>
-              <img className="imgPreview" src={photoDataUrl} alt="captura o adjunta" />
+              <h2 className="h2" style={{ marginBottom: "12px" }}>Vista previa del ECG</h2>
+              <img className="imgPreview" src={previewUrl} alt="ECG escaneado" style={{ maxWidth: "100%", borderRadius: "8px" }} />
             </div>
           )}
-
-          {camError && <p className="error" role="alert">Error cámara: {camError}</p>}
         </div>
       )}
 
-      {/* ── PANTALLA 4: Resultado ── */}
-      {step === "result" && apiResponse && (
-        <div className="stack result">
+      {/* ── PANTALLA 4: Resultado (REDISEÑADA) ── */}
+    {step === "result" && (
+  <div className="stack result">
+      {effectiveRisk.level === "alto" && (
+            <div className="urgent-banner" role="alert" aria-live="assertive">
+              <div className="urgent-banner__icon">🚨</div>
+              <div className="urgent-banner__body">
+                <div className="urgent-banner__title">DERIVACIÓN URGENTE A CARDIOLOGÍA</div>
+                <div className="urgent-banner__subtitle">Se detectaron hallazgos compatibles con alto riesgo. Actúe de inmediato.</div>
+              </div>
+            </div>
+          )}
           <h1 className="h1">Resultado del análisis</h1>
-
           <div className="context">
             <div className="chip">👨‍⚕️ {doctorName || "—"}</div>
-            <div className="chip">🧑‍🦱 Paciente: {form.name || "—"}</div>
-            <div className="chip">🎂 Edad: {form.age || "—"}</div>
-            {form.smoker && <div className="chip chip--warn">🚬 Fumador</div>}
-            {form.heartIssues && <div className="chip chip--warn">❤ Antecedentes cardíacos</div>}
+            <div className="chip">🧑 {form.name || "—"} ({form.age || "—"} años)</div>
+            {Object.entries(form.antecedentes).filter(([, c]) => c).map(([k]) => (
+                <div key={k} className="chip chip--warn">{ANTECEDENTES_OPTIONS[k as keyof typeof ANTECEDENTES_OPTIONS]}</div>
+            ))}
           </div>
 
-          {apiResponse.review && (
-            <div className="alert alert--danger">
-              <div className="alert__icon">⚠️</div>
-              <div className="alert__body">
-                <div className="alert__title">Revisión necesaria</div>
-                <div className="alert__text">LLAMAR A UN CARDIÓLOGO</div>
-              </div>
-            </div>
+          <div className={`card card--elevated risk-card`} data-level={effectiveRisk.level}>
+            <span className="badge" data-level={effectiveRisk.level}>{effectiveRisk.title}</span>
+            <h2 className="risk-card__description">{effectiveRisk.description}</h2>
+            <p className="risk-card__action"><strong>Acción Sugerida:</strong> {effectiveRisk.action}</p>
+          </div>
+
+          {(effectiveRisk.level !== "bajo" && effectiveRisk.level !== "error") && (
+            effectiveRisk.level === "alto" ? (
+              <a href={whatsappUrl} target="_blank" rel="noopener noreferrer" className="btn btn-large btn-whatsapp btn-urgent">
+                🚑 Derivar URGENTE (WhatsApp)
+              </a>
+            ) : (
+              <a href={whatsappUrl} target="_blank" rel="noopener noreferrer" className="btn btn-primary btn-large btn-whatsapp">
+                📱 Derivar a Cardiólogo (WhatsApp)
+              </a>
+            )
           )}
 
-          <div className="card card--elevated resultCard">
-            <div className="result__header">
-              <span className="badge">Pre-diagnóstico</span>
-              <h2 className="result__title">
-                {apiResponse.prediction?.class ?? "—"}
-              </h2>
-              <div className="confidence">
-                <span>Confianza</span>
-                <strong>{pct(apiResponse.prediction?.probability)}</strong>
-              </div>
-              <div className="bar">
-                <div
-                  className="bar__fill"
-                  style={{ width: `${Math.round((apiResponse.prediction?.probability ?? 0) * 100)}%` }}
-                />
-              </div>
-            </div>
+          <div className="disclaimer card"><small><strong>Recordatorio:</strong> Esta es una herramienta de apoyo. La decisión final corresponde al profesional.</small></div>
 
-            {!!apiResponse.predictions?.length && (
-              <div className="altList">
-                <div className="altList__title">Otras probabilidades</div>
-                <div className="altList__grid">
-                  {apiResponse.predictions.map((p, i) => (
-                    <div key={i} className="altItem">
-                      <div className="altItem__head">
-                        <span className="altItem__class">{p.class}</span>
-                        <span className="altItem__pct">{pct(p.probability)}</span>
-                      </div>
-                      <div className="bar bar--thin">
-                        <div
-                          className="bar__fill"
-                          style={{ width: `${Math.round((p.probability ?? 0) * 100)}%` }}
-                        />
+          <details className="card evidence-card">
+            <summary className="h2" style={{cursor: "pointer"}}>Ver detalles del análisis de la imagen</summary>
+            {apiResponse && (
+                <div className="resultCard" style={{marginTop: "16px"}}>
+                  <div className="result__header">
+                    <h3 className="result__title">{apiResponse.prediction?.class ?? "—"}</h3>
+                    <div className="confidence"><span>Confianza</span><strong>{pct(apiResponse.prediction?.probability)}</strong></div>
+                    <div className="bar"><div className="bar__fill" style={{ width: `${Math.round((apiResponse.prediction?.probability ?? 0) * 100)}%` }} /></div>
+                  </div>
+                  {!!apiResponse?.predictions?.length && (
+                    <div className="altList">
+                      <div className="altList__title">Otras probabilidades</div>
+                      <div className="altList__grid">
+                        {apiResponse.predictions.map((p, i) => (
+                          <div key={i} className="altItem">
+                            <div className="altItem__head">
+                              <span className="altItem__class">{p.class}</span>
+                              <span className="altItem__pct">{pct(p.probability)}</span>
+                            </div>
+                            <div className="bar bar--thin">
+                              <div className="bar__fill" style={{ width: `${Math.round((p.probability ?? 0) * 100)}%` }} />
+                            </div>
+                          </div>
+                        ))}
                       </div>
                     </div>
-                  ))}
+                  )}
                 </div>
-              </div>
             )}
-
-            {typeof apiResponse.margin === "number" && (
-              <div className="meta">
-                <span className="meta__label">Margen</span>
-                <code className="meta__code">{apiResponse.margin.toFixed(4)}</code>
-              </div>
+            {photoDataUrl && (
+                <div className="imgCard" style={{marginTop: "16px"}}>
+                    <h3 className="h3">Imagen Analizada</h3>
+                    <img className="imgPreview imgPreview--rounded" src={photoDataUrl} alt="ECG escaneado" />
+                </div>
             )}
-          </div>
-
-          {photoDataUrl && (
-            <div className="card imgCard">
-              <img className="imgPreview imgPreview--rounded" src={photoDataUrl} alt="captura o adjunta" />
-            </div>
-          )}
-
+          </details>
+          
           <div className="toolbar toolbar--sticky">
-            <button className="btn btn-primary" onClick={() => setStep("camera")}>
-              ➕ Analizar otra imagen
+            <button className="btn btn-secondary" onClick={() => {
+              resetForm();
+              clearPhoto();
+              setApiResponse(null);
+              setStep("form");
+            }}>
+              ➕ Analizar Nuevo Paciente
             </button>
-            <button className="btn btn-ghost" onClick={() => setStep("form")}>
-              ← Volver al formulario
-            </button>
-          </div>
-        </div>
-      )}
-
-      {step === "result" && !apiResponse && (
-        <div className="stack">
-          <h1 className="h1">Resultado del análisis</h1>
-          <div className="card">No hay respuesta disponible.</div>
-          <div className="toolbar">
-            <button className="btn btn-primary" onClick={() => setStep("camera")}>
-              Volver a la cámara
+            <button className="btn btn-ghost" onClick={() => setStep("camera")}>
+              ← Escanear de nuevo
             </button>
           </div>
         </div>

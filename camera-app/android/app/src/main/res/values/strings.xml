@@ -1,0 +1,7 @@
+<?xml version='1.0' encoding='utf-8'?>
+<resources>
+    <string name="app_name">app-movil-ecg</string>
+    <string name="title_activity_main">app-movil-ecg</string>
+    <string name="package_name">com.belen.ecg</string>
+    <string name="custom_url_scheme">com.belen.ecg</string>
+</resources>
