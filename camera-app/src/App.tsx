@@ -45,63 +45,76 @@ declare global {
   interface Window { cv: any }
 }
 
-/** Espera a que OpenCV.js esté cargado */
+/** Espera a que OpenCV.js esté cargado con timeout de 5 segundos */
 async function waitForOpenCV(): Promise<void> {
   if (typeof window === "undefined") return;
-  await new Promise<void>((res) => {
-    const check = () => (window as any).cv && (window as any).cv.Mat ? res() : setTimeout(check, 50);
+  return new Promise<void>((res, rej) => {
+    const timeoutId = setTimeout(() => {
+      rej(new Error("OpenCV no disponible"));
+    }, 5000);
+    const check = () => {
+      if ((window as any).cv && (window as any).cv.Mat) {
+        clearTimeout(timeoutId);
+        res();
+      } else {
+        setTimeout(check, 100);
+      }
+    };
     check();
   });
 }
 
-/** Mejora tipo escáner: corrige perspectiva y binariza. Devuelve dataURL */
+/** Convierte imagen a B/N (grayscale). Si falla, devuelve original. */
 async function enhanceDocumentWithOpenCV(srcDataUrl: string): Promise<string> {
-  await waitForOpenCV();
-  const cv = (window as any).cv;
+  try {
+    await waitForOpenCV();
+    const cv = (window as any).cv;
 
-  const img = await (async () => {
-    const i = new window.Image();
-    i.crossOrigin = "anonymous";
-    i.src = srcDataUrl;
-    await new Promise((resolve, reject) => {
-      i.onload = () => resolve(null);
-      i.onerror = () => reject(new Error("No se pudo cargar la imagen. Verifique permisos o formato."));
+    const img = new Image();
+    img.src = srcDataUrl;
+    
+    await new Promise<void>((resolve, reject) => {
+      img.onload = () => resolve();
+      img.onerror = () => reject(new Error("No se pudo cargar imagen"));
+      setTimeout(() => reject(new Error("Timeout cargando imagen")), 3000);
     });
-    // Validar tamaño
-    if (!i.width || !i.height) throw new Error("La imagen no se pudo cargar correctamente. Pruebe con otra foto o revise los permisos del navegador.");
-    return i;
-  })();
 
-  // dataURL -> Mat
-  const canvas = document.createElement("canvas");
-  canvas.width = img.width; canvas.height = img.height;
-  const ctx = canvas.getContext("2d")!;
-  ctx.drawImage(img, 0, 0);
-  const src = cv.imread(canvas);
+    const canvas = document.createElement("canvas");
+    canvas.width = img.width;
+    canvas.height = img.height;
+    const ctx = canvas.getContext("2d");
+    if (!ctx) return srcDataUrl;
+    ctx.drawImage(img, 0, 0);
 
-  // Mejorar contraste y escaneo tipo documento
-  const gray = new cv.Mat();
-  cv.cvtColor(src, gray, cv.COLOR_RGBA2GRAY);
+    const src = cv.imread(canvas);
+    const gray = new cv.Mat();
+    cv.cvtColor(src, gray, cv.COLOR_RGBA2GRAY);
 
-  // Suavizado para reducir ruido
-  const blurred = new cv.Mat();
-  cv.GaussianBlur(gray, blurred, new cv.Size(3,3), 0);
+    const blurred = new cv.Mat();
+    cv.GaussianBlur(gray, blurred, new cv.Size(3, 3), 0);
 
-  // Umbralización adaptativa más suave
-  const bin = new cv.Mat();
-  cv.adaptiveThreshold(blurred, bin, 255, cv.ADAPTIVE_THRESH_MEAN_C, cv.THRESH_BINARY, 15, 10);
+    const bin = new cv.Mat();
+    cv.adaptiveThreshold(blurred, bin, 255, cv.ADAPTIVE_THRESH_MEAN_C, cv.THRESH_BINARY, 15, 10);
 
-  // Convertir a dataURL
-  const outCanvas = document.createElement("canvas");
-  outCanvas.width = bin.cols; outCanvas.height = bin.rows;
-  cv.imshow(outCanvas, bin);
-  const dstDataUrl = outCanvas.toDataURL("image/png");
+    const outCanvas = document.createElement("canvas");
+    outCanvas.width = bin.cols;
+    outCanvas.height = bin.rows;
+    cv.imshow(outCanvas, bin);
+    const result = outCanvas.toDataURL("image/png");
 
-  // liberar
-  src.delete(); gray.delete(); blurred.delete(); bin.delete();
+    src.delete();
+    gray.delete();
+    blurred.delete();
+    bin.delete();
 
-  return dstDataUrl;
+    return result;
+  } catch (err) {
+    console.warn("OpenCV fallo, usando original:", err);
+    return srcDataUrl;
+  }
 }
+
+
 
 /* ── Capacitor helpers ─────────────────────────────────────────────────── */
 const isNative = Capacitor.isNativePlatform();
@@ -230,19 +243,17 @@ export default function App() {
     setForm(getInitialFormState());
   };
 
-  /* ── Estados para manejo de imagen y API ── */
   const [photoDataUrl, setPhotoDataUrl] = useState<string | null>(null);
   const [apiLoading, setApiLoading] = useState(false);
   const [apiError, setApiError] = useState<string | null>(null);
   const [apiResponse, setApiResponse] = useState<ApiResponseShape | null>(null);
-  // Riesgo calculado por el servidor (si el backend lo devuelve)
+
   const [serverRisk, setServerRisk] = useState<RiskResult | null>(null);
   const [apiCustomError, setApiCustomError] = useState<string | null>(null);
   const [previewUrl, setPreviewUrl] = useState<string | null>(null);
 
   /* ── Escaneo y procesamiento de imagen (ROBUSTO, tomado del 1º código) ── */
   const handleScanDocument = async () => {
-    // En navegador (ngrok) no hay plugin: disparamos file picker
     if (!isNative || !Capacitor.isPluginAvailable?.("DocumentScanner")) {
       fileInputRef.current?.click();
       return;
@@ -271,15 +282,15 @@ export default function App() {
           reader.readAsDataURL(blob);
         });
 
-        // Procesar imagen para mejorar visualización del ECG
+        // Procesar imagen con OpenCV (B/N)
         const processedImage = await enhanceDocumentWithOpenCV(dataUrl);
         setPhotoDataUrl(processedImage);
-        setPreviewUrl(processedImage); // Mostrar previsualización
+        setPreviewUrl(processedImage);
         setApiResponse(null);
         setApiError(null);
       } catch (err) {
-        console.error("Error al procesar la imagen:", err);
-        throw new Error("No se pudo procesar la imagen escaneada");
+        console.error("Error al escanear:", err);
+        setApiError("Error al escanear la imagen");
       }
     } catch (e: any) {
       console.error("Error al escanear:", e);
@@ -293,14 +304,20 @@ export default function App() {
       setApiError("El archivo debe ser una imagen.");
       return;
     }
-    const dataUrl = await fileToDataUrl(file);
-    // Procesar imagen para mejorar visualización del ECG
-    const processedImage = await enhanceDocumentWithOpenCV(dataUrl);
-    setPhotoDataUrl(processedImage);
-    setPreviewUrl(processedImage); // Mostrar previsualización
-    setApiResponse(null);
-    setApiError(null);
-    if (step !== "camera") setStep("camera");
+
+    try {
+      const dataUrl = await fileToDataUrl(file);
+      // Procesar imagen con OpenCV (B/N)
+      const processedImage = await enhanceDocumentWithOpenCV(dataUrl);
+      setPhotoDataUrl(processedImage);
+      setPreviewUrl(processedImage);
+      setApiResponse(null);
+      setApiError(null);
+      if (step !== "camera") setStep("camera");
+    } catch (err: any) {
+      console.error("Error al cargar imagen:", err);
+      setApiError("Error al procesar la imagen");
+    }
   };
 
   const fileToDataUrl = (file: File) =>
@@ -340,9 +357,11 @@ export default function App() {
       return;
     }
 
-    // POST al backend para que devuelva el análisis del ECG + riesgo y acciones.
-    // Ajusta API_ANALYZE_URL según tu backend (ruta relativa /api/analyze por defecto).
-    const API_ANALYZE_URL = "/api/analyze";
+    // Prioriza la URL pública del backend definida en .env (VITE_API_URL).
+    // Si no existe, usamos el backend local en http://localhost:8000 (fallback).
+    const API_ANALYZE_URL = import.meta.env.VITE_API_URL
+      ? `${String(import.meta.env.VITE_API_URL).replace(/\/+$/,'')}/api/analyze`
+      : "http://localhost:8000/api/analyze";
 
     setApiLoading(true);
     setApiError(null);
@@ -369,16 +388,30 @@ export default function App() {
 
       const json = await resp.json();
 
-      // Se espera que el backend devuelva al menos { apiResponse?: ApiResponseShape, risk?: RiskResult }
-      setApiResponse(json.apiResponse ?? null);
-      setServerRisk(json.risk ?? null);
+      // Mapear respuesta del backend al formato esperado
+      const mappedApiResponse: ApiResponseShape = {
+        prediction: {
+          class: json.top_class || "Desconocido",
+          probability: json.top_prob ?? 0,
+        },
+        predictions: json.probs ? Object.entries(json.probs).map(([cls, prob]) => ({
+          class: cls,
+          probability: prob as number,
+        })) : undefined,
+      };
 
-      // Si el backend envía un mensaje de error personalizado
-      if (json.error || json.message) {
-        setApiCustomError(json.error ?? json.message ?? null);
-      }
+      // Mapear riesgo del backend
+      const mappedRisk: RiskResult = {
+        level: (json.risk_level?.toLowerCase() || "error") as RiskLevel,
+        title: json.risk_level || "Resultado",
+        description: json.explanation || json.recommendation || "Análisis completado",
+        action: json.recommendation || "Consulte con un especialista",
+      };
 
+      setApiResponse(mappedApiResponse);
+      setServerRisk(mappedRisk);
       setStep("result");
+
     } catch (err: any) {
       console.error("Error al comunicarse con el backend:", err);
       setApiError(err?.message ?? "Error al comunicarse con el servidor");
