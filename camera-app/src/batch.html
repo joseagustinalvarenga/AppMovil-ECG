@@ -1,0 +1,154 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="UTF-8" />
+  <title>ECG Batch Processor (JPG)</title>
+
+  <!-- OpenCV -->
+  <script async src="https://docs.opencv.org/3.4/opencv.js"></script>
+
+  <style>
+    body { font-family: sans-serif; padding: 20px; }
+    .log { white-space: pre-wrap; font-size: 14px; padding-top: 10px; }
+  </style>
+</head>
+
+<body>
+  <h1>Procesar Dataset (mismo filtro que App) — JPG por archivo</h1>
+
+  <input type="file" id="folder" webkitdirectory directory multiple />
+  <button id="btn">Procesar imágenes</button>
+
+  <div class="log" id="log"></div>
+
+<script>
+function log(txt) {
+  document.getElementById("log").textContent += txt + "\n";
+}
+
+function waitForOpenCV() {
+  return new Promise((resolve) => {
+    const check = () => {
+      if (window.cv && window.cv.Mat) resolve();
+      else setTimeout(check, 100);
+    };
+    check();
+  });
+}
+
+/* ---- MISMO PREPROCESO DEL FRONT ---- */
+async function enhanceDocumentWithOpenCV(srcDataUrl) {
+  await waitForOpenCV();
+  const cv = window.cv;
+
+  const img = new Image();
+  img.src = srcDataUrl;
+
+  await new Promise((resolve, reject) => {
+    img.onload = resolve;
+    img.onerror = reject;
+  });
+
+  const canvas = document.createElement("canvas");
+  canvas.width = img.width;
+  canvas.height = img.height;
+  const ctx = canvas.getContext("2d");
+  ctx.drawImage(img, 0, 0);
+
+  const src = cv.imread(canvas);
+  const gray = new cv.Mat();
+  cv.cvtColor(src, gray, cv.COLOR_RGBA2GRAY);
+
+  const blurred = new cv.Mat();
+  cv.GaussianBlur(gray, blurred, new cv.Size(3, 3), 0);
+
+  const bin = new cv.Mat();
+  cv.adaptiveThreshold(
+    blurred,
+    bin,
+    255,
+    cv.ADAPTIVE_THRESH_MEAN_C,
+    cv.THRESH_BINARY,
+    15,
+    10
+  );
+
+  const outCanvas = document.createElement("canvas");
+  outCanvas.width = bin.cols;
+  outCanvas.height = bin.rows;
+  cv.imshow(outCanvas, bin);
+
+  const jpg = outCanvas.toDataURL("image/jpeg", 0.92);
+
+  src.delete();
+  gray.delete();
+  blurred.delete();
+  bin.delete();
+
+  return jpg;
+}
+
+/* ---- MAPEO DE PREFIJOS ---- */
+const PREFIX_MAP = {
+ "PMI": "PMI",
+  "N": "N",
+};
+
+function getPrefixFromFolder(folderName) {
+  for (const key of Object.keys(PREFIX_MAP)) {
+    if (folderName.toLowerCase().includes(key.toLowerCase())) {
+      return PREFIX_MAP[key];
+    }
+  }
+  return "Unknown";
+}
+
+/* ---- PROCESAR Y DESCARGAR JPG ---- */
+document.getElementById("btn").onclick = async () => {
+  const files = [...document.getElementById("folder").files];
+  if (files.length === 0) {
+    alert("Elegí una carpeta primero.");
+    return;
+  }
+
+  log("Iniciando procesamiento...");
+
+  let count = 0;
+
+  for (const file of files) {
+    if (!file.type.startsWith("image/")) continue;
+
+    const rel = file.webkitRelativePath;
+    const parts = rel.split("/");
+    const classFolder = parts.length > 1 ? parts[1] : "unknown";
+
+    const prefix = getPrefixFromFolder(classFolder);
+
+    log(`Procesando: ${rel} → prefijo ${prefix}`);
+
+    const dataUrl = await new Promise((resolve) => {
+      const r = new FileReader();
+      r.onload = () => resolve(r.result);
+      r.readAsDataURL(file);
+    });
+
+    const processedJPG = await enhanceDocumentWithOpenCV(dataUrl);
+
+    const link = document.createElement("a");
+    link.href = processedJPG;
+
+    const baseName = file.name.replace(/\.[^/.]+$/, "");
+    link.download = `${prefix}_${baseName}.jpg`;
+
+    link.click();
+
+    count++;
+    if (count % 10 === 0) log(`${count} imágenes procesadas...`);
+  }
+
+  log("✔ Listo. Todas las imágenes JPG fueron descargadas.");
+};
+</script>
+
+</body>
+</html>
