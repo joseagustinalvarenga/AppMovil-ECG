@@ -4,6 +4,8 @@ import "./App.css";
 /* Capacitor + ML Kit (Document Scanner) */
 import { Capacitor } from "@capacitor/core";
 import { DocumentScanner } from "@capacitor-mlkit/document-scanner";
+import { Share } from "@capacitor/share";
+import { Filesystem, Directory } from "@capacitor/filesystem";
 
 /* ── Tipos ─────────────────────────────────────────────────────────────── */
 type Step = "welcome" | "form" | "camera" | "result";
@@ -33,8 +35,8 @@ type ApiResponseShape = {
 };
 
 /* ── Util ──────────────────────────────────────────────────────────────── */
-const pct = (p?: number) =>
-  typeof p === "number" ? (p * 100).toFixed(1) + "%" : "—";
+
+const todayStr = () => new Date().toLocaleDateString("es-AR", { day: '2-digit', month: '2-digit', year: 'numeric', hour: '2-digit', minute: '2-digit' });
 
 /* ── OpenCV "like scanner" helpers para WEB ────────────────────────────── */
 /**
@@ -46,7 +48,7 @@ declare global {
 }
 
 /** Espera a que OpenCV.js esté cargado con timeout de 5 segundos */
-async function waitForOpenCV(): Promise<void> {
+export async function waitForOpenCV(): Promise<void> {
   if (typeof window === "undefined") return;
   return new Promise<void>((res, rej) => {
     const timeoutId = setTimeout(() => {
@@ -65,14 +67,14 @@ async function waitForOpenCV(): Promise<void> {
 }
 
 /** Convierte imagen a B/N (grayscale). Si falla, devuelve original. */
-async function enhanceDocumentWithOpenCV(srcDataUrl: string): Promise<string> {
+export async function enhanceDocumentWithOpenCV(srcDataUrl: string): Promise<string> {
   try {
     await waitForOpenCV();
     const cv = (window as any).cv;
 
     const img = new Image();
     img.src = srcDataUrl;
-    
+
     await new Promise<void>((resolve, reject) => {
       img.onload = () => resolve();
       img.onerror = () => reject(new Error("No se pudo cargar imagen"));
@@ -122,12 +124,11 @@ const normalizeUri = (uri: string) => (isNative ? Capacitor.convertFileSrc(uri) 
 
 /* ── Opciones para Formularios ─────────────────────────────────────────── */
 const SINTOMAS_OPTIONS = [
-  { value: "dolor_precordial", label: "Dolor pre cordial" },
+  { value: "dolor_precordial", label: "Dolor precordial" },
   { value: "palpitaciones", label: "Palpitaciones" },
   { value: "disnea", label: "Disnea" },
   { value: "sincope", label: "Síncope" },
   { value: "mareos", label: "Mareos" },
-  { value: "otros", label: "Otros" },
 ];
 
 const INICIO_OPTIONS = [
@@ -140,7 +141,6 @@ const DESENCADENANTE_OPTIONS = [
   { value: "reposo", label: "Reposo" },
   { value: "emociones", label: "Emociones" },
   { value: "respiracion", label: "Con respiración" },
-  { value: "otro", label: "Otro" },
 ];
 
 const ANTECEDENTES_OPTIONS = {
@@ -160,13 +160,12 @@ const OTRAS_COND_OPTIONS = {
 };
 
 // Íconos para síntomas (Font Awesome)
-const SYMPTOM_ICONS: Record<string,string> = {
+const SYMPTOM_ICONS: Record<string, string> = {
   dolor_precordial: "fa-solid fa-heart-pulse",
   palpitaciones: "fa-solid fa-wave-square",
   disnea: "fa-solid fa-lungs",
   sincope: "fa-solid fa-brain",
   mareos: "fa-solid fa-arrows-rotate",
-  otros: "fa-solid fa-plus",
 };
 
 /* ── App ───────────────────────────────────────────────────────────────── */
@@ -187,7 +186,7 @@ export default function App() {
     e.preventDefault();
     setDoctorError(null);
     if (!doctorName.trim()) {
-      setDoctorError("Ingresá tu nombre para continuar.");
+      setDoctorError("Datos obligatorios.");
       return;
     }
     localStorage.setItem("doctorName", doctorName.trim());
@@ -207,7 +206,7 @@ export default function App() {
   });
 
   const [form, setForm] = useState<ClinicalInfo>(getInitialFormState());
-  const [formStep, setFormStep] = useState<1|2|3>(1);
+  const [formStep, setFormStep] = useState<1 | 2 | 3>(1);
   const [formError, setFormError] = useState<string | null>(null);
 
   const handleMultiSelectChange = (
@@ -228,17 +227,17 @@ export default function App() {
     e.preventDefault();
     setFormError(null);
     if (!form.name.trim()) {
-      setFormError("El nombre del paciente es obligatorio."); return;
+      setFormError("Nombre requerido."); return;
     }
     if (form.age === "" || Number.isNaN(Number(form.age)) || Number(form.age) <= 0) {
-      setFormError("La edad debe ser un número válido mayor a 0."); return;
+      setFormError("Edad inválida."); return;
     }
     if (!form.sintomaPrincipal) {
-      setFormError("El síntoma principal es obligatorio."); return;
+      setFormError("Síntoma requerido."); return;
     }
     setStep("camera");
   };
-  
+
   const resetForm = () => {
     setForm(getInitialFormState());
   };
@@ -251,6 +250,7 @@ export default function App() {
   const [serverRisk, setServerRisk] = useState<RiskResult | null>(null);
   const [apiCustomError, setApiCustomError] = useState<string | null>(null);
   const [previewUrl, setPreviewUrl] = useState<string | null>(null);
+  const [showScoreModal, setShowScoreModal] = useState(false);
 
   /* ── Escaneo y procesamiento de imagen (ROBUSTO, tomado del 1º código) ── */
   const handleScanDocument = async () => {
@@ -282,10 +282,9 @@ export default function App() {
           reader.readAsDataURL(blob);
         });
 
-        // Procesar imagen con OpenCV (B/N)
-        const processedImage = await enhanceDocumentWithOpenCV(dataUrl);
-        setPhotoDataUrl(processedImage);
-        setPreviewUrl(processedImage);
+        // Usar imagen original (sin procesar con OpenCV)
+        setPhotoDataUrl(dataUrl);
+        setPreviewUrl(dataUrl);
         setApiResponse(null);
         setApiError(null);
       } catch (err) {
@@ -294,7 +293,12 @@ export default function App() {
       }
     } catch (e: any) {
       console.error("Error al escanear:", e);
-      setApiError(e?.message ?? "No se pudo abrir el escáner");
+      const errMsg = e?.message || String(e);
+      if (errMsg.toLowerCase().includes("cancel") || errMsg.includes("result code 0")) {
+        // Ignorar de forma amigable si el usuario cancela la captura
+        return;
+      }
+      setApiError(errMsg || "No se pudo abrir el escáner");
     }
   };
 
@@ -307,10 +311,9 @@ export default function App() {
 
     try {
       const dataUrl = await fileToDataUrl(file);
-      // Procesar imagen con OpenCV (B/N)
-      const processedImage = await enhanceDocumentWithOpenCV(dataUrl);
-      setPhotoDataUrl(processedImage);
-      setPreviewUrl(processedImage);
+      // Usar imagen original (sin procesar con OpenCV)
+      setPhotoDataUrl(dataUrl);
+      setPreviewUrl(dataUrl);
       setApiResponse(null);
       setApiError(null);
       if (step !== "camera") setStep("camera");
@@ -338,15 +341,16 @@ export default function App() {
   /* ── Wizard handlers ─────────────────────────────────────────────────── */
   const nextFromBasics = () => {
     setFormError(null);
-    if (!form.name.trim()) { setFormError("El nombre del paciente es obligatorio."); return; }
+    if (!form.name.trim()) { setFormError("Nombre requerido."); return; }
     if (form.age === "" || Number.isNaN(Number(form.age)) || Number(form.age) <= 0) {
-      setFormError("La edad debe ser un número válido mayor a 0."); return; }
+      setFormError("Edad inválida."); return;
+    }
     setFormStep(2);
   };
 
   const nextFromSymptoms = () => {
     setFormError(null);
-    if (!form.sintomaPrincipal) { setFormError("Seleccioná el síntoma principal."); return; }
+    if (!form.sintomaPrincipal) { setFormError("Seleccioná el síntoma."); return; }
     setFormStep(3);
   };
 
@@ -360,7 +364,7 @@ export default function App() {
     // Prioriza la URL pública del backend definida en .env (VITE_API_URL).
     // Si no existe, usamos el backend local en http://localhost:8000 (fallback).
     const API_ANALYZE_URL = import.meta.env.VITE_API_URL
-      ? `${String(import.meta.env.VITE_API_URL).replace(/\/+$/,'')}/api/analyze`
+      ? `${String(import.meta.env.VITE_API_URL).replace(/\/+$/, '')}/api/analyze`
       : "http://localhost:8000/api/analyze";
 
     setApiLoading(true);
@@ -388,24 +392,44 @@ export default function App() {
 
       const json = await resp.json();
 
+      const translateClass = (rawCls: string) => {
+        if (!rawCls) return "Desconocido";
+        const cls = rawCls.trim().toLowerCase();
+
+        if (cls === "normal") return "Normal";
+        if (cls === "Abnormal_Heartbeat" || cls === "abnormal" || cls === "anormal") return "Latido Anormal";
+        if (cls === "myocardial infarction" || cls === "mi") return "Infarto de Miocardio";
+        if (cls === "history of mi" || cls.includes("history")) return "Antecedente de Infarto";
+
+        // Fallback robusto por si envía solo "Infarction" o variaciones
+        if (cls.includes("infarction")) return "Infarto de Miocardio";
+
+        return rawCls;
+      };
+
       // Mapear respuesta del backend al formato esperado
       const mappedApiResponse: ApiResponseShape = {
         prediction: {
-          class: json.top_class || "Desconocido",
+          class: translateClass(json.top_class || "Desconocido"),
           probability: json.top_prob ?? 0,
         },
         predictions: json.probs ? Object.entries(json.probs).map(([cls, prob]) => ({
-          class: cls,
+          class: translateClass(cls),
           probability: prob as number,
         })) : undefined,
       };
 
       // Mapear riesgo del backend
+      let parsedLevel = json.risk_level?.toLowerCase() || "error";
+      if (parsedLevel === "moderado" || parsedLevel === "moderate") parsedLevel = "medio";
+
       const mappedRisk: RiskResult = {
-        level: (json.risk_level?.toLowerCase() || "error") as RiskLevel,
+        level: parsedLevel as RiskLevel,
         title: json.risk_level || "Resultado",
         description: json.explanation || json.recommendation || "Análisis completado",
         action: json.recommendation || "Consulte con un especialista",
+        score: json.score,
+        score_breakdown: json.score_breakdown,
       };
 
       setApiResponse(mappedApiResponse);
@@ -427,13 +451,70 @@ export default function App() {
     title: string;
     description: string;
     action: string;
+    score?: number;
+    score_breakdown?: { label: string; pts: number }[];
   };
 
-  const calculateCombinedRisk = (
-    apiResp: ApiResponseShape | null,
-    clinicalData: ClinicalInfo
-  ): RiskResult => {
-    if (!apiResp || !apiResp.prediction) {
+
+
+  // 1. Calcula puntuación de riesgo clínico de forma dinámica
+  const getScoreBreakdown = () => {
+    let score = 0;
+    const items: { label: string; pts: number }[] = [];
+
+    const add = (label: string, pts: number) => {
+      if (pts > 0) {
+        items.push({ label, pts });
+        score += pts;
+      }
+    };
+
+    // 1. Sintoma Principal
+    if (form.sintomaPrincipal === "dolor_precordial") add("Síntoma: Dolor precordial", 3);
+    else if (["palpitaciones", "sincope", "disnea"].includes(form.sintomaPrincipal)) {
+      add("Síntoma: " + (SINTOMAS_OPTIONS.find(o => o.value === form.sintomaPrincipal)?.label || form.sintomaPrincipal), 2);
+    }
+    else if (form.sintomaPrincipal === "mareos") {
+      add("Síntoma: Mareos", 1);
+    }
+
+    // 2. Antecedentes
+    if (form.antecedentes.tabaquista) add("Antecedente: Tabaquista", 2);
+    if (form.antecedentes.enf_coronaria) add("Antecedente: Enf. coronaria", 3);
+    if (form.antecedentes.diabetes) add("Antecedente: Diabetes", 2);
+    if (form.antecedentes.dislipemia) add("Antecedente: Dislipemia", 1);
+    if (form.antecedentes.hta) add("Antecedente: HTA", 2);
+    if (form.antecedentes.arritmia) add("Antecedente: Arritmia", 2);
+
+    // 3. Otras Condiciones
+    if (form.otrasCond.fiebre) add("Condición: Fiebre", 1);
+    if (form.otrasCond.anemia) add("Condición: Anemia", 2);
+    if (form.otrasCond.hipoxia) add("Condición: Hipoxia", 3);
+    if (form.otrasCond.sustancias) add("Condición: Sustancias", 2);
+
+    // 4. Medicacion
+    if (form.medicacion === "si") add("Medicación Relevante", 1);
+
+    // 5. Inteligencia Artificial (Clase predicha)
+    if (apiResponse?.prediction) {
+      if (apiResponse.prediction.class === "Infarto de Miocardio") {
+        add("IA: Patrón Infarto de Miocardio", Math.round(apiResponse.prediction.probability * 5));
+      } else if (apiResponse.prediction.class === "Latido Anormal") {
+        add("IA: Patrón Latido Anormal", Math.round(apiResponse.prediction.probability * 3));
+      }
+    }
+
+    return { score, items };
+  };
+
+  const scoreData = serverRisk?.score !== undefined && serverRisk?.score_breakdown !== undefined
+    ? { score: serverRisk.score, items: serverRisk.score_breakdown }
+    : getScoreBreakdown();
+  const riskScore = scoreData.score;
+
+  // 2. Lógica Estricta basada en Tabla de Puntuación
+  const getEffectiveRisk = (): RiskResult => {
+    if (!apiResponse || !apiResponse.prediction) {
       return {
         level: "error",
         title: "Error de Análisis",
@@ -441,55 +522,35 @@ export default function App() {
         action: "Por favor, intente escanear nuevamente.",
       };
     }
-    const { prediction } = apiResp;
-    const { antecedentes, sintomaPrincipal } = clinicalData;
 
-    // REGLA 1: ALTO RIESGO
-    if (prediction.class === "MI" && prediction.probability > 0.8) {
+    const forceAlto = serverRisk?.level === "alto" ||
+      (apiResponse.prediction.class === "Infarto de Miocardio" && apiResponse.prediction.probability >= 0.5);
+
+    if (riskScore >= 10 || forceAlto) {
       return {
         level: "alto",
-        title: "ALTO RIESGO DETECTADO",
-        description: "El modelo detecta patrones consistentes con Infarto de Miocardio (MI) con alta confianza.",
-        action: "Se recomienda derivación urgente a cardiología.",
+        title: "ALTO RIESGO",
+        description: "Score Clínico ≥ 10 o Detección Crítica de IA.",
+        action: "Derivar urgente / evaluación urgente según disponibilidad"
       };
-    }
-    if (prediction.class === "Anormal" && antecedentes.tabaquista && sintomaPrincipal === "dolor_precordial") {
-      return {
-        level: "alto",
-        title: "ALTO RIESGO POR CLÍNICA",
-        description: "El modelo detecta anomalías en un paciente con factores de riesgo clave (tabaquista, dolor precordial).",
-        action: "Se recomienda derivación urgente a cardiología.",
-      };
-    }
-    // REGLA 2: RIESGO MEDIO
-    if (prediction.class === "Anormal" || apiResp.review === true) {
+    } else if (riskScore >= 5 && riskScore < 10) {
       return {
         level: "medio",
-        title: "REVISIÓN SUGERIDA",
-        description: "El modelo detecta patrones anómalos no específicos o el resultado es inconcluso.",
-        action: "Se sugiere derivar a cardiología para un análisis completo.",
+        title: "RIESGO MODERADO",
+        description: "Score Clínico entre 5 y 9.",
+        action: "Consulta recomendada en corto plazo / control y seguimiento"
       };
-    }
-    // REGLA 3: BAJO RIESGO
-    if (prediction.class === "Normal" && prediction.probability > 0.7) {
+    } else {
       return {
         level: "bajo",
-        title: "PROBABLE NORMALIDAD",
-        description: "El modelo no detecta anomalías significativas.",
-        action: "Confirmar el diagnóstico con la evaluación clínica completa.",
+        title: "RIESGO BAJO",
+        description: "Score Clínico menor a 5.",
+        action: "Seguimiento ambulatorio"
       };
     }
-    // Fallback
-    return {
-      level: "medio",
-      title: "REVISIÓN SUGERIDA",
-      description: "El resultado del modelo es inconcluso. Se recomienda evaluación manual.",
-      action: "Se sugiere derivar a cardiología si la clínica lo justifica.",
-    };
   };
 
-  // Si el backend retorna el riesgo completo, lo usamos; si no, fallback a la lógica local.
-  const effectiveRisk = serverRisk ?? calculateCombinedRisk(apiResponse, form);
+  const effectiveRisk = getEffectiveRisk();
 
   /* ── 📱 LÓGICA WHATSAPP (del 2º código) ──────────────────────────────── */
   const getWhatsAppMessage = () => {
@@ -497,18 +558,19 @@ export default function App() {
       .filter(([, isChecked]) => isChecked)
       .map(([key]) => ANTECEDENTES_OPTIONS[key as keyof typeof ANTECEDENTES_OPTIONS])
       .join(', ');
-      
+
     const otrasCondTxt = Object.entries(form.otrasCond)
       .filter(([, isChecked]) => isChecked)
       .map(([key]) => OTRAS_COND_OPTIONS[key as keyof typeof OTRAS_COND_OPTIONS])
       .join(', ');
 
     const message = `
-*PRE-DIAGNÓSTICO ECG*
+*REPORTE PRELIMINAR ECG*
+*Fecha:* ${todayStr()}
 *Médico:* ${doctorName}
 *Paciente:* ${form.name} (${form.age} años)
 
-*Datos Clínicos:*
+*CUADRO CLÍNICO:*
 - *Síntoma:* ${SINTOMAS_OPTIONS.find(o => o.value === form.sintomaPrincipal)?.label || 'N/A'}
 - *Inicio:* ${INICIO_OPTIONS.find(o => o.value === form.inicio)?.label || 'N/A'}
 - *Desencadenante:* ${DESENCADENANTE_OPTIONS.find(o => o.value === form.desencadenante)?.label || 'N/A'}
@@ -516,375 +578,549 @@ export default function App() {
 - *Otras Cond.:* ${otrasCondTxt || 'Ninguna'}
 - *Medicación:* ${form.medicacion.toUpperCase() || 'N/A'}
 
-*Resultado de la App:*
-- *Nivel de Riesgo:* ${effectiveRisk.title}
-- *Acción Sugerida:* ${effectiveRisk.action}
+*ANÁLISIS DE IA:*
+- *Clase Predicha:* ${apiResponse?.prediction?.class || 'N/A'}
+- *Confianza:* ${apiResponse?.prediction?.probability ? (apiResponse.prediction.probability * 100).toFixed(1) + '%' : 'N/A'}
+- *Score Clínico:* ${riskScore.toFixed(1)} pts
+- *Resultado:* ${effectiveRisk.title}
+- *Recomendación:* ${effectiveRisk.action}
 
-_(Se adjunta imagen del ECG)_
+_(Imagen adjunta)_
     `;
     return encodeURIComponent(message.trim());
   };
-  
-  const WHATSAPP_NUMBER = "+5493754477472"; 
+
+  const WHATSAPP_NUMBER = "+5493754477472";
   const whatsappUrl = `https://wa.me/${WHATSAPP_NUMBER}?text=${getWhatsAppMessage()}`;
 
+  const handleShare = async () => {
+    const text = decodeURIComponent(getWhatsAppMessage());
+
+    if (isNative && photoDataUrl) {
+      try {
+        const base64Data = photoDataUrl.split(',')[1];
+        const fileName = `ECG_${form.name.replace(/\s+/g, '_')}_${Date.now()}.png`;
+
+        const result = await Filesystem.writeFile({
+          path: fileName,
+          data: base64Data,
+          directory: Directory.Cache,
+        });
+
+        await Share.share({
+          title: `Reporte ECG - ${form.name}`,
+          text: text,
+          url: result.uri,
+          dialogTitle: 'Compartir reporte de ECG',
+        });
+      } catch (err: any) {
+        console.error("Error al compartir de forma nativa:", err);
+        window.open(whatsappUrl, '_blank');
+      }
+    } else {
+      if (navigator.share && photoDataUrl) {
+        try {
+          const response = await fetch(photoDataUrl);
+          const blob = await response.blob();
+          const file = new File([blob], `ECG_${form.name.replace(/\s+/g, '_')}.png`, { type: 'image/png' });
+
+          await navigator.share({
+            title: `Reporte ECG - ${form.name}`,
+            text: text,
+            files: [file]
+          });
+        } catch (err) {
+          console.warn("navigator.share failed, falling back to whatsapp URL:", err);
+          window.open(whatsappUrl, '_blank');
+        }
+      } else {
+        window.open(whatsappUrl, '_blank');
+      }
+    }
+  };
+
+  /* Componentes Internos para UI Limpia */
+  const AppHeader = () => (
+    <header className="app-header">
+      <div className="app-brand">
+        {/* Usamos un ícono médico como logo placeholder */}
+        <i className="fa-solid fa-heart-pulse" style={{ fontSize: 24, color: '#38bdf8' }}></i>
+        <span>CardioScan<span style={{ opacity: 0.6 }}>PRO</span></span>
+      </div>
+      {doctorName && (
+        <div className="user-profile">
+          <i className="fa-solid fa-user-doctor"></i>
+          <span>{doctorName}</span>
+        </div>
+      )}
+    </header>
+  );
 
   return (
     <div className="app">
-      {/* Font Awesome for medical-styled icons */}
+      {/* Font Awesome */}
       <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.0/css/all.min.css" />
-      <style>{`
-        .urgent-banner { display:flex; align-items:center; gap:12px; background: linear-gradient(90deg,#7f1d1d,#dc2626); color:#fff; padding:16px; border-radius:12px; border:2px solid #ef4444; animation: urgentPulse 1.5s infinite; }
-        .urgent-banner__icon { font-size:28px; }
-        .urgent-banner__body { display:flex; flex-direction:column; }
-        .urgent-banner__title { font-weight:800; letter-spacing:.5px; font-size:18px; line-height:1.1; }
-        .urgent-banner__subtitle { font-size:14px; opacity:.95; margin-top:2px; }
-        @keyframes urgentPulse { 0%{box-shadow:0 0 0 0 rgba(220,38,38,.7)} 70%{box-shadow:0 0 0 14px rgba(220,38,38,0)} 100%{box-shadow:0 0 0 0 rgba(220,38,38,0)} }
-        .btn-urgent { background:#b91c1c; border:2px solid #ef4444; color:#fff !important; animation: urgentPulse 1.5s infinite; }
-        .risk-card[data-level="alto"] { border:2px solid #ef4444; }
 
-        /* Wizard styles */
-        .stepper { display:flex; gap:8px; margin-bottom:12px; }
-        .step-dot { width:10px; height:10px; border-radius:999px; background:#e5e7eb; }
-        .step-dot.active { background:#2563eb; }
-        .section-title { font-weight:700; font-size:18px; margin:4px 0 8px; }
+      {step !== "welcome" && <AppHeader />}
 
-        /* Symptom cards grid */
-        .symptom-grid { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:10px; }
-        @media (min-width:420px){ .symptom-grid{ grid-template-columns:repeat(3,minmax(0,1fr)); } }
-        .symptom-card {
-          display:flex;
-          flex-direction:column;
-          align-items:flex-start;
-          gap:6px;
-          padding:14px;
-          border:2px solid #ffffff;
-          border-radius:14px;
-          background:#0d1b4f;
-          cursor:pointer;
-          user-select:none;
-          color:#ffffff !important;
-        }
-        .symptom-card i { font-size:18px; opacity:.9; }
-        .symptom-card .label { font-size:14px; font-weight:600; }
-        .symptom-card.active {
-          border-color:#60a5fa;
-          background:#1e3a8a;
-          color:#ffffff !important;
-        }
-        .controls-row { display:flex; gap:10px; }
-      `}</style>
-      <style>{`
-        .urgent-banner { display:flex; align-items:center; gap:12px; background: linear-gradient(90deg,#7f1d1d,#dc2626); color:#fff; padding:16px; border-radius:12px; border:2px solid #ef4444; animation: urgentPulse 1.5s infinite; }
-        .urgent-banner__icon { font-size:28px; }
-        .urgent-banner__body { display:flex; flex-direction:column; }
-        .urgent-banner__title { font-weight:800; letter-spacing:.5px; font-size:18px; line-height:1.1; }
-        .urgent-banner__subtitle { font-size:14px; opacity:.95; margin-top:2px; }
-        @keyframes urgentPulse { 0%{box-shadow:0 0 0 0 rgba(220,38,38,.7)} 70%{box-shadow:0 0 0 14px rgba(220,38,38,0)} 100%{box-shadow:0 0 0 0 rgba(220,38,38,0)} }
-        .btn-urgent { background:#b91c1c; border:2px solid #ef4444; color:#fff !important; animation: urgentPulse 1.5s infinite; }
-        .risk-card[data-level="alto"] { border:2px solid #ef4444; }
-      `}</style>
-      {/* ── PANTALLA 1: Bienvenida / Médico ── */}
-      {step === "welcome" && (
-        <div className="app" style={{ display: "flex", alignItems: "center", justifyContent: "center" }}>
-          <div className="card card--elevated" style={{ textAlign: "center", padding: "32px 24px", maxWidth: 400, width: "100%" }}>
-            <img src="/logo.png" alt="Logo" style={{ width: 96, height: 96, objectFit: "contain", margin: "0 auto 16px", display: "block" }} />
-            <h1 className="h1">Ingreso del médico</h1>
-            <p className="subtle" style={{ marginTop: 4 }}>Ingresá tu nombre para continuar.</p>
-            <form onSubmit={handleEnter} className="form" style={{ marginTop: 16 }}>
-              <div className="field">
-                <label className="label" htmlFor="doctor">Nombre del médico</label>
-                <input id="doctor" className="input" type="text" value={doctorName} onChange={(e) => setDoctorName(e.target.value)} placeholder="Ej: Dra. María González" required autoComplete="name" />
+      <main className="main-content">
+
+        {/* ── PANTALLA 1: Bienvenida / Médico ── */}
+        {step === "welcome" && (
+          <div style={{ display: "flex", flex: 1, alignItems: "center", justifyContent: "center", flexDirection: 'column' }}>
+            <div className="card" style={{ maxWidth: 400, width: "100%", padding: 40, textAlign: 'center' }}>
+              <div style={{ marginBottom: 24 }}>
+                <i className="fa-solid fa-heart-pulse" style={{ fontSize: 56, color: 'var(--primary)' }}></i>
               </div>
-              {doctorError && <p className="error" role="alert">{doctorError}</p>}
-              <div className="toolbar" style={{ justifyContent: "center" }}>
-                <button type="submit" className="btn btn-primary">Ingresar</button>
+              <h1 style={{ fontSize: '1.5rem', fontWeight: 800, color: 'var(--brand-dark)', margin: '0 0 8px' }}>CardioScan PRO</h1>
+              <p className="subtle">Sistema de Análisis de ECG</p>
+
+              <form onSubmit={handleEnter} style={{ marginTop: 32, display: 'flex', flexDirection: 'column', gap: 16 }}>
+                <div>
+                  <label className="label" htmlFor="doctor" style={{ textAlign: 'left' }}>Identificación Profesional</label>
+                  <input
+                    id="doctor"
+                    className="input"
+                    type="text"
+                    value={doctorName}
+                    onChange={(e) => setDoctorName(e.target.value)}
+                    placeholder="Dr./Dra. Nombre Apellido"
+                    required
+                    autoComplete="name"
+                  />
+                </div>
+
+                {doctorError && <div style={{ color: 'var(--danger)', fontSize: '0.85rem' }}>{doctorError}</div>}
+
+                <button type="submit" className="btn btn-primary" style={{ width: '100%' }}>
+                  Iniciar Sesión
+                </button>
+              </form>
+            </div>
+            <div style={{ marginTop: 20, fontSize: '0.8rem', color: 'var(--text-muted)' }}>
+              v2.0.1 • Uso Profesional Exclusivo
+            </div>
+          </div>
+        )}
+
+        {/* ── PANTALLA 2: Formulario paciente (WIZARD) ── */}
+        {step === "form" && (
+          <div className="stack">
+            <div className="steps-indicator">
+              <div className={`step-item ${formStep >= 1 ? 'active' : ''}`}>
+                <div className="step-circle">1</div>
+                <span>Datos</span>
               </div>
-            </form>
-          </div>
-        </div>
-      )}
-
-      {/* ── PANTALLA 2: Formulario paciente (COMPLETO) ── */}
-      {step === "form" && (
-        <div className="stack formPage full-viewport">
-          <h1 className="h1">Información clínica del paciente</h1>
-          <div className="subtle" style={{ marginBottom: 4 }}>
-            Médico: <strong>{doctorName || "—"}</strong>
-          </div>
-
-          <form className="card form card--elevated formCard" onSubmit={(e)=>{e.preventDefault(); if(formStep===1) nextFromBasics(); else if(formStep===2) nextFromSymptoms(); else handleStartCamera(e);}} noValidate>
-            {/* Stepper */}
-            <div className="stepper" aria-hidden>
-              <div className={`step-dot ${formStep===1?"active":""}`}></div>
-              <div className={`step-dot ${formStep===2?"active":""}`}></div>
-              <div className={`step-dot ${formStep===3?"active":""}`}></div>
+              <div className={`step-item ${formStep >= 2 ? 'active' : ''}`}>
+                <div className="step-circle">2</div>
+                <span>Clínica</span>
+              </div>
+              <div className={`step-item ${formStep >= 3 ? 'active' : ''}`}>
+                <div className="step-circle">3</div>
+                <span>Antecedentes</span>
+              </div>
             </div>
 
-            {/* Paso 1: Datos básicos */}
-            {formStep===1 && (
-              <div className="stack">
-                <div className="section-title">Datos básicos</div>
-                <div className="row-fields">
-                  <div className="field" style={{ flex: 2 }}>
-                    <label className="label" htmlFor="name">Nombre del paciente</label>
-                    <input id="name" className="input" type="text" value={form.name} onChange={(e) => setForm((f) => ({ ...f, name: e.target.value }))} placeholder="Ej: Juan Pérez" required />
-                  </div>
-                  <div className="field" style={{ flex: 1 }}>
-                    <label className="label" htmlFor="age">Edad</label>
-                    <input id="age" className="input" type="number" min={1} max={120} value={form.age} onChange={(e) => setForm((f) => ({ ...f, age: e.target.value === "" ? "" : Number(e.target.value) }))} placeholder="Ej: 45" required inputMode="numeric" />
-                  </div>
-                </div>
-                {formError && <p className="error" role="alert">{formError}</p>}
-                <div className="toolbar">
-                  <button type="submit" className="btn btn-primary">Continuar →</button>
-                  <button type="button" className="btn btn-ghost" onClick={() => setStep("welcome")}>
-                    ← Cambiar médico
-                  </button>
-                </div>
-              </div>
-            )}
+            <form onSubmit={(e) => { e.preventDefault(); if (formStep === 1) nextFromBasics(); else if (formStep === 2) nextFromSymptoms(); else handleStartCamera(e); }} noValidate>
 
-            {/* Paso 2: Síntoma principal y contexto */}
-            {formStep===2 && (
-              <div className="stack">
-                <div className="section-title">Síntoma principal</div>
-                <div className="symptom-grid">
-                  {SINTOMAS_OPTIONS.map(opt => (
-                    <button type="button" key={opt.value}
-                      className={`symptom-card ${form.sintomaPrincipal===opt.value?"active":""}`}
-                      onClick={()=> setForm(f=>({ ...f, sintomaPrincipal: opt.value }))}
-                      aria-pressed={form.sintomaPrincipal===opt.value}
-                    >
-                      <i className={SYMPTOM_ICONS[opt.value]} aria-hidden></i>
-                      <span className="label">{opt.label}</span>
-                    </button>
-                  ))}
-                </div>
-
-                <div className="controls-row">
-                  <div className="field" style={{ flex: 1 }}>
-                    <label className="label" htmlFor="inicio">Inicio</label>
-                    <select id="inicio" className="input" value={form.inicio} onChange={(e) => setForm((f) => ({ ...f, inicio: e.target.value }))}>
-                      <option value="">Seleccionar...</option>
-                      {INICIO_OPTIONS.map((opt) => (
-                        <option key={opt.value} value={opt.value}>{opt.label}</option>
-                      ))}
-                    </select>
+              {/* Paso 1: Datos básicos */}
+              {formStep === 1 && (
+                <div className="card">
+                  <div className="section-header">
+                    <i className="fa-solid fa-user-injured" style={{ color: 'var(--primary)' }}></i>
+                    <div className="section-title">Identificación de Paciente</div>
                   </div>
-                  <div className="field" style={{ flex: 1 }}>
-                    <label className="label" htmlFor="desencadenante">Desencadenante</label>
-                    <select id="desencadenante" className="input" value={form.desencadenante} onChange={(e) => setForm((f) => ({ ...f, desencadenante: e.target.value }))}>
-                      <option value="">Seleccionar...</option>
-                      {DESENCADENANTE_OPTIONS.map((opt) => (
-                        <option key={opt.value} value={opt.value}>{opt.label}</option>
-                      ))}
-                    </select>
+
+                  <div className="stack">
+                    <div>
+                      <label className="label" htmlFor="name">Nombre Completo</label>
+                      <input id="name" className="input" type="text" value={form.name} onChange={(e) => setForm((f) => ({ ...f, name: e.target.value }))} placeholder="Apellido, Nombre" required />
+                    </div>
+
+                    <div>
+                      <label className="label" htmlFor="age">Edad (Años)</label>
+                      <input id="age" className="input" type="number" min={1} max={120} value={form.age} onChange={(e) => setForm((f) => ({ ...f, age: e.target.value === "" ? "" : Number(e.target.value) }))} placeholder="00" required inputMode="numeric" />
+                    </div>
+                  </div>
+
+                  {formError && <div style={{ color: 'var(--danger)', marginTop: 12, fontSize: '0.9rem' }}>{formError}</div>}
+
+                  <div className="toolbar">
+                    <button type="button" className="btn btn-secondary" onClick={() => setStep("welcome")}>Salir</button>
+                    <button type="submit" className="btn btn-primary">Siguiente</button>
                   </div>
                 </div>
-
-                {formError && <p className="error" role="alert">{formError}</p>}
-                <div className="toolbar">
-                  <button type="button" className="btn btn-ghost" onClick={()=> setFormStep(1)}>← Volver</button>
-                  <button type="submit" className="btn btn-primary">Continuar →</button>
-                </div>
-              </div>
-            )}
-
-            {/* Paso 3: Factores de riesgo */}
-            {formStep===3 && (
-              <div className="stack">
-                <div className="section-title">Factores de riesgo</div>
-                <div className="field">
-                  <label className="label">Antecedentes</label>
-                  <div className="grid-checks">
-                    {Object.entries(ANTECEDENTES_OPTIONS).map(([key, label]) => (
-                      <label className="check" key={key}>
-                        <input className="checkbox" type="checkbox" checked={form.antecedentes[key]} onChange={(e) => handleMultiSelectChange("antecedentes", key, e.target.checked)} />
-                        {label}
-                      </label>
-                    ))}
-                  </div>
-                </div>
-
-                <div className="field">
-                  <label className="label">Otras condiciones</label>
-                  <div className="grid-checks">
-                    {Object.entries(OTRAS_COND_OPTIONS).map(([key, label]) => (
-                      <label className="check" key={key}>
-                        <input className="checkbox" type="checkbox" checked={form.otrasCond[key]} onChange={(e) => handleMultiSelectChange("otrasCond", key, e.target.checked)} />
-                        {label}
-                      </label>
-                    ))}
-                  </div>
-                </div>
-
-                <div className="field">
-                  <label className="label">¿Toma medicación relevante?</label>
-                  <div className="row-fields" style={{ gap: '16px', alignItems: 'center' }}>
-                    <label className="check">
-                      <input type="radio" name="medicacion" value="si" checked={form.medicacion === 'si'} onChange={() => setForm(f => ({...f, medicacion: 'si'}))} /> Sí
-                    </label>
-                    <label className="check">
-                      <input type="radio" name="medicacion" value="no" checked={form.medicacion === 'no'} onChange={() => setForm(f => ({...f, medicacion: 'no'}))} /> No
-                    </label>
-                  </div>
-                </div>
-
-                {formError && <p className="error" role="alert">{formError}</p>}
-                <div className="toolbar">
-                  <button type="button" className="btn btn-ghost" onClick={()=> setFormStep(2)}>← Volver</button>
-                  <button type="submit" className="btn btn-primary">Ir al escaneo →</button>
-                </div>
-              </div>
-            )}
-          </form>
-        </div>
-      )}
-
-      {/* ── PANTALLA 3: Escaneo de ECG ── */}
-      {step === "camera" && (
-        <div className="stack">
-          <h1 className="h1">Escanear ECG</h1>
-          <div className="subtle" style={{ marginBottom: 4 }}>
-            Médico: <strong>{doctorName || "—"}</strong> · Paciente: <strong>{form.name}</strong>
-          </div>
-          <div className="card card--elevated" style={{ padding: "20px", textAlign: "center" }}>
-            <p className="subtle" style={{ marginBottom: "20px" }}>
-              Coloque el ECG sobre una superficie plana con buena iluminación y presione el botón
-            </p>
-            <div className="toolbar" style={{ justifyContent: "center" }}>
-              <button onClick={handleScanDocument} className="btn btn-primary btn-large" disabled={apiLoading} style={{ fontSize: "1.2em", padding: "12px 24px" }}>
-                📄 Escanear ECG
-              </button>
-              {(!isNative || !Capacitor.isPluginAvailable?.("DocumentScanner")) && (
-                <label className="btn btn-secondary" style={{ cursor: "pointer" }}>
-                  📎 Cargar archivo
-                  <input ref={fileInputRef} type="file" accept="image/*" style={{ display: "none" }} onChange={(e) => {
-                      const file = e.target.files?.[0];
-                      if (file) handleFilePick(file);
-                      e.currentTarget.value = "";
-                    }}/>
-                </label>
               )}
-            </div>
-          </div>
-          <div className="toolbar">
-            <button onClick={sendImageToApi} className="btn btn-secondary" disabled={apiLoading || !photoDataUrl}>
-              {apiLoading ? "Analizando ECG..." : "Analizar ECG"}
-            </button>
-            <button onClick={() => setStep("form")} className="btn btn-ghost" disabled={apiLoading}>
-              ← Volver al formulario
-            </button>
-            {photoDataUrl && (
-              <button onClick={clearPhoto} className="btn btn-ghost" disabled={apiLoading}>
-                🗑️ Borrar imagen
-              </button>
-            )}
-          </div>
-          {apiError && <p className="error" role="alert">Error: {apiError}</p>}
-          {previewUrl && (
-            <div className="card">
-              <h2 className="h2" style={{ marginBottom: "12px" }}>Vista previa del ECG</h2>
-              <img className="imgPreview" src={previewUrl} alt="ECG escaneado" style={{ maxWidth: "100%", borderRadius: "8px" }} />
-            </div>
-          )}
-        </div>
-      )}
 
-      {/* ── PANTALLA 4: Resultado (REDISEÑADA) ── */}
-    {step === "result" && (
-  <div className="stack result">
-      {effectiveRisk.level === "alto" && (
-            <div className="urgent-banner" role="alert" aria-live="assertive">
-              <div className="urgent-banner__icon">🚨</div>
-              <div className="urgent-banner__body">
-                <div className="urgent-banner__title">DERIVACIÓN URGENTE A CARDIOLOGÍA</div>
-                <div className="urgent-banner__subtitle">Se detectaron hallazgos compatibles con alto riesgo. Actúe de inmediato.</div>
-              </div>
-            </div>
-          )}
-          <h1 className="h1">Resultado del análisis</h1>
-          <div className="context">
-            <div className="chip">👨‍⚕️ {doctorName || "—"}</div>
-            <div className="chip">🧑 {form.name || "—"} ({form.age || "—"} años)</div>
-            {Object.entries(form.antecedentes).filter(([, c]) => c).map(([k]) => (
-                <div key={k} className="chip chip--warn">{ANTECEDENTES_OPTIONS[k as keyof typeof ANTECEDENTES_OPTIONS]}</div>
-            ))}
-          </div>
-
-          <div className={`card card--elevated risk-card`} data-level={effectiveRisk.level}>
-            <span className="badge" data-level={effectiveRisk.level}>{effectiveRisk.title}</span>
-            <h2 className="risk-card__description">{effectiveRisk.description}</h2>
-            <p className="risk-card__action"><strong>Acción Sugerida:</strong> {effectiveRisk.action}</p>
-          </div>
-
-          {(effectiveRisk.level !== "bajo" && effectiveRisk.level !== "error") && (
-            effectiveRisk.level === "alto" ? (
-              <a href={whatsappUrl} target="_blank" rel="noopener noreferrer" className="btn btn-large btn-whatsapp btn-urgent">
-                🚑 Derivar URGENTE (WhatsApp)
-              </a>
-            ) : (
-              <a href={whatsappUrl} target="_blank" rel="noopener noreferrer" className="btn btn-primary btn-large btn-whatsapp">
-                📱 Derivar a Cardiólogo (WhatsApp)
-              </a>
-            )
-          )}
-
-          <div className="disclaimer card"><small><strong>Recordatorio:</strong> Esta es una herramienta de apoyo. La decisión final corresponde al profesional.</small></div>
-
-          <details className="card evidence-card">
-            <summary className="h2" style={{cursor: "pointer"}}>Ver detalles del análisis de la imagen</summary>
-            {apiResponse && (
-                <div className="resultCard" style={{marginTop: "16px"}}>
-                  <div className="result__header">
-                    <h3 className="result__title">{apiResponse.prediction?.class ?? "—"}</h3>
-                    <div className="confidence"><span>Confianza</span><strong>{pct(apiResponse.prediction?.probability)}</strong></div>
-                    <div className="bar"><div className="bar__fill" style={{ width: `${Math.round((apiResponse.prediction?.probability ?? 0) * 100)}%` }} /></div>
+              {/* Paso 2: Síntoma principal y contexto */}
+              {formStep === 2 && (
+                <div className="card">
+                  <div className="section-header">
+                    <i className="fa-solid fa-stethoscope" style={{ color: 'var(--primary)' }}></i>
+                    <div className="section-title">Presentación Clínica</div>
                   </div>
-                  {!!apiResponse?.predictions?.length && (
-                    <div className="altList">
-                      <div className="altList__title">Otras probabilidades</div>
-                      <div className="altList__grid">
-                        {apiResponse.predictions.map((p, i) => (
-                          <div key={i} className="altItem">
-                            <div className="altItem__head">
-                              <span className="altItem__class">{p.class}</span>
-                              <span className="altItem__pct">{pct(p.probability)}</span>
-                            </div>
-                            <div className="bar bar--thin">
-                              <div className="bar__fill" style={{ width: `${Math.round((p.probability ?? 0) * 100)}%` }} />
-                            </div>
+
+                  <div className="stack">
+                    <div>
+                      <label className="label">Síntoma Cardinal</label>
+                      <div className="input" style={{ padding: 0, border: 'none', background: 'transparent', overflowY: 'auto', maxHeight: 200 }}>
+                        {SINTOMAS_OPTIONS.map(opt => (
+                          <div key={opt.value}
+                            style={{
+                              padding: '12px', borderBottom: '1px solid var(--border-light)',
+                              display: 'flex', alignItems: 'center', gap: 12, cursor: 'pointer',
+                              background: form.sintomaPrincipal === opt.value ? 'var(--primary-light)' : 'transparent',
+                              color: form.sintomaPrincipal === opt.value ? 'var(--primary)' : 'inherit',
+                              fontWeight: form.sintomaPrincipal === opt.value ? 700 : 400
+                            }}
+                            onClick={() => setForm(f => ({ ...f, sintomaPrincipal: opt.value }))}
+                          >
+                            <i className={SYMPTOM_ICONS[opt.value]} style={{ width: 20, textAlign: 'center' }}></i>
+                            {opt.label}
+                            {form.sintomaPrincipal === opt.value && <i className="fa-solid fa-check" style={{ marginLeft: 'auto' }}></i>}
                           </div>
                         ))}
                       </div>
                     </div>
-                  )}
+
+                    <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 12 }}>
+                      <div>
+                        <label className="label" htmlFor="inicio">Inicio</label>
+                        <select id="inicio" value={form.inicio} onChange={(e) => setForm((f) => ({ ...f, inicio: e.target.value }))}>
+                          <option value="">Seleccionar...</option>
+                          {INICIO_OPTIONS.map((opt) => (
+                            <option key={opt.value} value={opt.value}>{opt.label}</option>
+                          ))}
+                        </select>
+                      </div>
+                      <div>
+                        <label className="label" htmlFor="desencadenante">Contexto</label>
+                        <select id="desencadenante" value={form.desencadenante} onChange={(e) => setForm((f) => ({ ...f, desencadenante: e.target.value }))}>
+                          <option value="">Seleccionar...</option>
+                          {DESENCADENANTE_OPTIONS.map((opt) => (
+                            <option key={opt.value} value={opt.value}>{opt.label}</option>
+                          ))}
+                        </select>
+                      </div>
+                    </div>
+                  </div>
+
+                  {formError && <div style={{ color: 'var(--danger)', marginTop: 12, fontSize: '0.9rem' }}>{formError}</div>}
+
+                  <div className="toolbar">
+                    <button type="button" className="btn btn-secondary" onClick={() => setFormStep(1)}>Atrás</button>
+                    <button type="submit" className="btn btn-primary">Siguiente</button>
+                  </div>
                 </div>
-            )}
-            {photoDataUrl && (
-                <div className="imgCard" style={{marginTop: "16px"}}>
-                    <h3 className="h3">Imagen Analizada</h3>
-                    <img className="imgPreview imgPreview--rounded" src={photoDataUrl} alt="ECG escaneado" />
+              )}
+
+              {/* Paso 3: Factores de riesgo */}
+              {formStep === 3 && (
+                <div className="card">
+                  <div className="section-header">
+                    <i className="fa-solid fa-file-medical" style={{ color: 'var(--primary)' }}></i>
+                    <div className="section-title">Antecedentes y Factores</div>
+                  </div>
+
+                  <div className="stack">
+                    <div>
+                      <label className="label">Comorbilidades</label>
+                      <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 8 }}>
+                        {Object.entries(ANTECEDENTES_OPTIONS).map(([key, label]) => (
+                          <div key={key}
+                            onClick={() => handleMultiSelectChange("antecedentes", key, !form.antecedentes[key])}
+                            style={{
+                              padding: '8px 12px', borderRadius: 4, cursor: 'pointer', fontSize: '0.85rem',
+                              border: form.antecedentes[key] ? '1px solid var(--primary)' : '1px solid var(--border)',
+                              background: form.antecedentes[key] ? 'var(--primary-light)' : 'white',
+                              color: form.antecedentes[key] ? 'var(--primary-dark)' : 'var(--text-muted)'
+                            }}
+                          >
+                            {label}
+                          </div>
+                        ))}
+                      </div>
+                    </div>
+
+                    <div>
+                      <label className="label">Signos Vitales / Condiciones</label>
+                      <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 8 }}>
+                        {Object.entries(OTRAS_COND_OPTIONS).map(([key, label]) => (
+                          <div key={key}
+                            onClick={() => handleMultiSelectChange("otrasCond", key, !form.otrasCond[key])}
+                            style={{
+                              padding: '8px 12px', borderRadius: 4, cursor: 'pointer', fontSize: '0.85rem',
+                              border: form.otrasCond[key] ? '1px solid var(--primary)' : '1px solid var(--border)',
+                              background: form.otrasCond[key] ? 'var(--primary-light)' : 'white',
+                              color: form.otrasCond[key] ? 'var(--primary-dark)' : 'var(--text-muted)'
+                            }}
+                          >
+                            {label}
+                          </div>
+                        ))}
+                      </div>
+                    </div>
+
+                    <div>
+                      <label className="label">Medicación Relevante</label>
+                      <div className="segmented-control">
+                        <div className={`segment-opt ${form.medicacion === 'si' ? 'active' : ''}`} onClick={() => setForm(f => ({ ...f, medicacion: 'si' }))}>Sí</div>
+                        <div className={`segment-opt ${form.medicacion === 'no' ? 'active' : ''}`} onClick={() => setForm(f => ({ ...f, medicacion: 'no' }))}>No</div>
+                      </div>
+                    </div>
+                  </div>
+
+                  {formError && <div style={{ color: 'var(--danger)', marginTop: 12, fontSize: '0.9rem' }}>{formError}</div>}
+
+                  <div className="toolbar">
+                    <button type="button" className="btn btn-secondary" onClick={() => setFormStep(2)}>Atrás</button>
+                    <button type="submit" className="btn btn-primary">
+                      <i className="fa-solid fa-camera" style={{ marginRight: 8 }}></i>
+                      Capturar ECG
+                    </button>
+                  </div>
                 </div>
-            )}
-          </details>
-          
-          <div className="toolbar toolbar--sticky">
-            <button className="btn btn-secondary" onClick={() => {
-              resetForm();
-              clearPhoto();
-              setApiResponse(null);
-              setStep("form");
-            }}>
-              ➕ Analizar Nuevo Paciente
-            </button>
-            <button className="btn btn-ghost" onClick={() => setStep("camera")}>
-              ← Escanear de nuevo
-            </button>
+              )}
+            </form>
           </div>
-        </div>
-      )}
+        )}
+
+        {/* ── PANTALLA 3: Escaneo de ECG ── */}
+        {step === "camera" && (
+          <div className="scan-screen">
+            {/* Header con info del paciente */}
+            <div className="scan-patient-bar">
+              <i className="fa-solid fa-user-injured"></i>
+              <span>{form.name} • {form.age} años</span>
+            </div>
+
+            {/* Área principal de escaneo */}
+            <div className="scan-area">
+              {photoDataUrl ? (
+                <div className="scan-preview-container">
+                  <img src={previewUrl || ""} className="scan-preview-img" alt="ECG capturado" />
+                  <div className="scan-preview-badge">
+                    <i className="fa-solid fa-check-circle"></i> Imagen capturada
+                  </div>
+                </div>
+              ) : (
+                <div className="scan-placeholder">
+                  <div className="scan-frame">
+                    <div className="scan-corner scan-corner-tl"></div>
+                    <div className="scan-corner scan-corner-tr"></div>
+                    <div className="scan-corner scan-corner-bl"></div>
+                    <div className="scan-corner scan-corner-br"></div>
+                    <div className="scan-line-anim"></div>
+                  </div>
+                  <div className="scan-instructions">
+                    <div className="scan-icon-pulse">
+                      <i className="fa-solid fa-camera-retro"></i>
+                    </div>
+                    <h3>Escanear ECG</h3>
+                    <p>Alinee el trazado del electrocardiograma dentro del recuadro y presione <strong>Capturar</strong></p>
+                  </div>
+                </div>
+              )}
+            </div>
+
+            {/* Botones de acción */}
+            <div className="scan-actions">
+              {!photoDataUrl ? (
+                <>
+                  <button onClick={handleScanDocument} className="scan-btn-capture">
+                    <i className="fa-solid fa-camera"></i>
+                    <span>Capturar ECG</span>
+                  </button>
+
+                  {(!isNative || !Capacitor.isPluginAvailable?.("DocumentScanner")) && (
+                    <label className="scan-btn-upload">
+                      <i className="fa-solid fa-image"></i>
+                      <span>Galería</span>
+                      <input ref={fileInputRef} type="file" accept="image/*" style={{ display: "none" }} onChange={(e) => {
+                        const file = e.target.files?.[0]; if (file) handleFilePick(file); e.currentTarget.value = "";
+                      }} />
+                    </label>
+                  )}
+                </>
+              ) : (
+                <>
+                  <button onClick={sendImageToApi} className="scan-btn-analyze" disabled={apiLoading}>
+                    {apiLoading ? (
+                      <><i className="fa-solid fa-spinner fa-spin"></i><span>Analizando...</span></>
+                    ) : (
+                      <><i className="fa-solid fa-microscope"></i><span>Analizar ECG</span></>
+                    )}
+                  </button>
+                  <button onClick={clearPhoto} className="scan-btn-retry" disabled={apiLoading}>
+                    <i className="fa-solid fa-rotate-right"></i>
+                    <span>Reintentar</span>
+                  </button>
+                </>
+              )}
+            </div>
+
+            <button onClick={() => setStep("form")} className="scan-btn-cancel" disabled={apiLoading}>
+              <i className="fa-solid fa-arrow-left" style={{ marginRight: 8 }}></i>
+              Volver al formulario
+            </button>
+
+            {apiError && <div className="scan-error"><i className="fa-solid fa-circle-exclamation"></i> {apiError}</div>}
+          </div>
+        )}
+
+        {/* ── PANTALLA 4: Resultado (LAB REPORT STYLE) ── */}
+        {step === "result" && (
+          <div className="stack">
+
+            <div className={`premium-report-card level-${effectiveRisk.level}`}>
+              {/* Disclaimer Prominente */}
+              <div className="premium-disclaimer">
+                <i className="fa-solid fa-triangle-exclamation"></i>
+                <span><strong>Herramienta de apoyo diagnóstico</strong> · No reemplaza la evaluación médica</span>
+              </div>
+
+              <header className="premium-report-header">
+                <div className="premium-header-logo">
+                  <div className="premium-header-logo-icon">
+                    <i className="fa-solid fa-file-medical-alt"></i>
+                  </div>
+                  <div>
+                    <h2>Reporte Clínico</h2>
+                    <p>Fecha de emisión: {todayStr()}</p>
+                  </div>
+                </div>
+                <div className="premium-patient-id">
+                  ID: PAC-{Math.floor(1000 + Math.random() * 9000)}
+                </div>
+              </header>
+
+              <div className="premium-report-body">
+                {/* Clase Ganadora */}
+                <div className="premium-section premium-hero-result">
+                  <div className="premium-label" style={{ justifyContent: 'center' }}>
+                    <i className="fa-solid fa-microscope"></i> Patrón Compatible
+                  </div>
+                  <div className="premium-diagnosis-title">
+                    {apiResponse?.prediction?.class || 'No determinado'}
+                  </div>
+                  <div className="premium-diagnosis-subtitle" style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', gap: '12px', marginTop: '12px' }}>
+                    <span>Análisis algorítmico de trazado</span>
+                    {apiResponse?.prediction?.probability !== undefined && (
+                      <span style={{
+                        background: '#e0f2fe',
+                        color: '#0284c7',
+                        padding: '4px 10px',
+                        borderRadius: '999px',
+                        fontWeight: 700,
+                        fontSize: '0.85rem'
+                      }}>
+                        Certeza: {(apiResponse.prediction.probability * 100).toFixed(1)}%
+                      </span>
+                    )}
+                  </div>
+                </div>
+
+                {/* Grilla de Métricas (Riesgo y Score) */}
+                <div className="premium-metrics-grid">
+                  <div className="premium-metric-card">
+                    <div className="premium-label" style={{ justifyContent: 'center' }}>Nivel de Riesgo Global</div>
+                    <div className={`premium-risk-badge badge-${effectiveRisk.level}`}>
+                      {effectiveRisk.level === 'alto' && <><i className="fa-solid fa-circle-exclamation"></i> ALTO</>}
+                      {effectiveRisk.level === 'medio' && <><i className="fa-solid fa-triangle-exclamation"></i> MODERADO</>}
+                      {effectiveRisk.level === 'bajo' && <><i className="fa-solid fa-circle-check"></i> BAJO</>}
+                      {effectiveRisk.level === 'error' && <><i className="fa-solid fa-circle-xmark"></i> ERROR</>}
+                    </div>
+                  </div>
+
+                  <div className="premium-metric-card clickable-card" onClick={() => setShowScoreModal(true)} style={{ cursor: 'pointer', position: 'relative' }}>
+                    <div className="premium-label" style={{ justifyContent: 'center' }}>
+                      Score Clínico Total
+                      <i className="fa-solid fa-circle-info" style={{ marginLeft: 6, opacity: 0.6 }}></i>
+                    </div>
+                    <div className="premium-score-value">
+                      <span className="score-number">{riskScore.toFixed(1)}</span>
+                      <span className="score-unit">pts</span>
+                    </div>
+                  </div>
+                </div>
+
+                {/* Modal de Desglose de Score */}
+                {showScoreModal && (
+                  <div className="score-modal-overlay" onClick={() => setShowScoreModal(false)}>
+                    <div className="score-modal-content" onClick={e => e.stopPropagation()}>
+                      <div className="score-modal-header">
+                        <h3>Detalle del Score Clínico</h3>
+                        <button onClick={() => setShowScoreModal(false)} className="score-modal-close">
+                          <i className="fa-solid fa-xmark"></i>
+                        </button>
+                      </div>
+                      <div className="score-modal-body">
+                        {scoreData.items.length === 0 ? (
+                          <div style={{ textAlign: 'center', padding: '20px', color: 'var(--text-muted)' }}>No hay puntos asignados.</div>
+                        ) : (
+                          <div className="score-breakdown-list">
+                            {scoreData.items.map((item, idx) => (
+                              <div key={idx} className="score-breakdown-item">
+                                <span>{item.label}</span>
+                                <strong>+{item.pts} pts</strong>
+                              </div>
+                            ))}
+                          </div>
+                        )}
+                        <div className="score-breakdown-total">
+                          <span>Total Puntos</span>
+                          <span>{riskScore} pts</span>
+                        </div>
+                      </div>
+                    </div>
+                  </div>
+                )}
+
+                {/* Plan Sugerido */}
+                <div className={`premium-plan plan-${effectiveRisk.level}`}>
+                  <div className="premium-label">
+                    <i className="fa-solid fa-notes-medical"></i> Plan Sugerido
+                  </div>
+                  <div className="premium-plan-content">
+                    <i className="fa-solid fa-user-doctor"></i>
+                    <p>{effectiveRisk.action}</p>
+                  </div>
+                </div>
+              </div>
+
+              <footer className="premium-report-footer">
+                <div>
+                  Validado por: <strong>{doctorName}</strong> (Licencia: PRO-2026)
+                </div>
+                <div>
+                  Paciente: <strong>{form.name}</strong> - v1.0.4
+                </div>
+              </footer>
+            </div>
+
+            <div className="toolbar" style={{ flexWrap: 'wrap' }}>
+              <button onClick={handleShare} className="btn btn-primary">
+                <i className="fa-brands fa-whatsapp" style={{ marginRight: 8 }}></i>
+                Compartir por WhatsApp
+              </button>
+              <button
+                onClick={() => { clearPhoto(); setStep("camera"); }}
+                className="btn btn-secondary"
+              >
+                <i className="fa-solid fa-camera-rotate" style={{ marginRight: 8 }}></i>
+                Re-escanear ECG
+              </button>
+              <button
+                onClick={() => { clearPhoto(); setStep("welcome"); resetForm(); }}
+                className="btn btn-secondary"
+              >
+                Nuevo Análisis
+              </button>
+            </div>
+
+          </div>
+        )}
+      </main>
     </div>
   );
 }

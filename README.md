@@ -1,7 +1,7 @@
 INICIAR LA APP 
 
 (reemplazar por tu ubicacion)
-cd "C:\Users\belen\OneDrive\Escritorio\app movil\AppMovil-ECG\camera-app"
+cd "C:\Users\usuario\Documents\TESIS PROYECTOS\AppMovil-ECG\AppMovil-ECG\camera-app"
 npm run dev -- --host 0.0.0.0 --port 5173
 
 levantar en ngrok:

@@ -10,12 +10,18 @@ createRoot(document.getElementById('root')!).render(
   </StrictMode>,
 )
 
-// Register service worker from public/sw.js (works in production build/preview)
+// Unregister service worker from public/sw.js if it was previously registered
 if ('serviceWorker' in navigator) {
-  window.addEventListener('load', () => {
-    navigator.serviceWorker
-      .register('/sw.js')
-      .then((reg) => console.log('SW registered', reg))
-      .catch((err) => console.warn('SW registration failed', err))
-  })
+  navigator.serviceWorker.getRegistrations().then((registrations) => {
+    for (const registration of registrations) {
+      registration.unregister().then((success) => {
+        if (success) {
+          console.log('SW unregistered successfully');
+          // Reload the page to load assets from the new build
+          window.location.reload();
+        }
+      });
+    }
+  });
 }
+
