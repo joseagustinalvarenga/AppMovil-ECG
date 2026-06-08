@@ -398,7 +398,7 @@ export default function App() {
         const cls = rawCls.trim().toLowerCase();
 
         if (cls === "normal") return "Normal";
-        if (cls === "Abnormal_Heartbeat" || cls === "abnormal" || cls === "anormal") return "Latido Anormal";
+        if (cls === "abnormal_heartbeat" || cls === "abnormal" || cls === "anormal") return "Latido Anormal";
         if (cls === "myocardial infarction" || cls === "mi") return "Infarto de Miocardio";
         if (cls === "history of mi" || cls.includes("history")) return "Antecedente de Infarto";
 
