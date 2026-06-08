@@ -240,6 +240,7 @@ export default function App() {
 
   const resetForm = () => {
     setForm(getInitialFormState());
+    setFormStep(1);
   };
 
   const [photoDataUrl, setPhotoDataUrl] = useState<string | null>(null);
